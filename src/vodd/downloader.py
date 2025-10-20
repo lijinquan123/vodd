@@ -16,8 +16,10 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
+import urllib3
 from prettytable import PrettyTable
 
+from vodd.core.algorithms import format_duration
 from vodd.core.constants import MediaName
 from vodd.core.exceptions import *
 from vodd.core.files import TEMP_DIR
@@ -75,6 +77,7 @@ class Downloader(object):
                 code = resp.status_code
             except requests.exceptions.SSLError:
                 self.request_kwargs['verify'] = False
+                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
                 logger.warning('检测到存在SSL认证，已自动忽略')
                 time.sleep(0.1)
             except (requests.exceptions.RequestException, Exception) as e:
@@ -205,7 +208,7 @@ class Downloader(object):
             # 耗时使用00:00, 文件大小使用MB, 速度使用MB/s
             logger.info(
                 f'下载完成, '
-                f'耗时: {cost}s, '
+                f'耗时: {format_duration(cost)}, '
                 f'文件大小: {size}MB, '
                 f'速度: {size / cost:.2f}MB/s, '
                 f'文件已保存到{self.save_path.as_posix()}'
@@ -213,7 +216,7 @@ class Downloader(object):
         self.wipe()
         return {
             'error': self.error,
-            'save_path': self.save_path,
+            'save_path': self.save_path.as_posix(),
         }
 
 
@@ -332,7 +335,7 @@ class DownloadCore(object):
     def select(self):
         available_formats = self.downloader.plugin.get_formats()
         table = PrettyTable()
-        table.field_names = ["序号", "分辨率", "码率", "帧率", "编码", "MIME类型"]
+        table.field_names = ["序号", "分辨率/语言", "码率/描述", "帧率/采样率", "编码", "MIME类型"]
         for mt, fs in available_formats.items():
             for f in fs:
                 if mt == MediaName.video:

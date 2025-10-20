@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vodd"
+version = "1.0.0"
+description = "VOD Downloader"
+authors = [
+    { name = "lijinquan123", email = "3291742120@qq.com" }
+]
+requires-python = ">=3.14.0"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [
+    "DRM @ git+https://github.com/lijinquan123/DRM.git",
+    "isodate>=0.7.2",
+    "lxml>=6.0.2",
+    "prettytable>=3.16.0",
+    "pydantic>=2.12.0",
+    "requests>=2.32.5",
+]
+[project.scripts]
+vodd = "vodd.main:main"

@@ -8,6 +8,11 @@ from vodd.core.exceptions import *
 from vodd.core.models import VideoMedia
 
 
+def format_duration(seconds: float) -> str:
+    minutes, sec = divmod(seconds, 60)
+    return f"{int(minutes)}m{int(sec)}s"
+
+
 def convert_to_num(s: str) -> float:
     if not s:
         return 0

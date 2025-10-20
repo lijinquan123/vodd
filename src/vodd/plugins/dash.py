@@ -42,7 +42,7 @@ class DASH(BasePlugin):
                 raise NotFoundError(f'未找到DRM客户端ID: {cip}')
             if not self.downloader.kwargs['drm_request']:
                 raise NotFoundError('未提供DRM请求数据')
-            logger.warning(f'检测到DRM版权视频：{segment.cipher.name}')
+            logger.warning(f'检测到DRM版权格式：{segment.cipher.name}')
 
     def get_license(self, request: dict) -> bytes:
         if 'method' not in (kwargs := get_request_kwargs(**request, with_url=True)):
@@ -62,7 +62,7 @@ class DASH(BasePlugin):
                     with self._drm_lock:
                         # 双重检查，防止重复进入
                         if not self.drm_key_content:
-                            logger.warning(f'正在请求DRM key')
+                            logger.warning(f'正在请求DRM密钥')
                             # pssh一般只在元数据中
                             pssh_file = segment.init_path if segment.init_path else encrypt_file
                             dmp = mp4parse.mp4dump(pssh_file.as_posix())
@@ -81,7 +81,7 @@ class DASH(BasePlugin):
                             oem = OEMCrypto(license_data, license_request.msg, private_key)
                             # 返回解密秘钥
                             self.drm_key_content = f'{kid}:{oem.decrypt().todict()[kid]}'
-                            logger.warning(f'DRM key: {self.drm_key_content}')
+                            logger.warning(f'DRM [kid:key]: {self.drm_key_content}')
                 # DRM 解密
                 decrypt_file = encrypt_file.with_stem(f'{encrypt_file.stem}_drm_decrypt')
                 decrypter.decrypting_file(

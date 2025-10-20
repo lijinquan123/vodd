@@ -3,6 +3,7 @@
 # @Time        : 2025/10/16 12:14
 # @Version     : Python 3.14.0
 import argparse
+import json
 import logging
 import sys
 import traceback
@@ -58,7 +59,7 @@ def main():
             if v == parser.get_default(k):
                 continue
             logger.info(f'{k}: {v}')
-        Downloader(**kwargs).start()
+        logger.info(f'下载返回值: {json.dumps(Downloader(**kwargs).start(), ensure_ascii=False)}')
     except (KeyboardInterrupt, Exception):
         traceback.print_exc()
         error_code = 130
