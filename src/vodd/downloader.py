@@ -49,6 +49,7 @@ class Downloader(object):
         self.kwargs = kwargs
         # 可选参数
         self.temp_dir = TEMP_DIR / md5(self.save_path.as_posix().encode('utf-8')).hexdigest()
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.per_timeout = kwargs['per_timeout']
         self.overall_timeout = kwargs['overall_timeout']
         self.max_download_times = kwargs['max_download_times']
