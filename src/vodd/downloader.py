@@ -272,7 +272,8 @@ class DownloadCore(object):
             url = segment.url
             filepath = segment.filepath
         self.downloader.smart_save(url, segment.headers, filepath)
-        self.downloader.plugin.decrypt(segment).rename(segment.filepath)
+        if not segment.init_url:
+            self.downloader.plugin.decrypt(segment).rename(segment.filepath)
         resp = self.downloader.requester('head', segment.url)
         if (
                 resp.headers.get('Accept-Ranges', '').lower() == 'bytes'
