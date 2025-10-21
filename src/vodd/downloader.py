@@ -19,7 +19,7 @@ import requests
 import urllib3
 from prettytable import PrettyTable
 
-from vodd.core.algorithms import format_duration, best_video, convert_to_num, get_resolution
+from vodd.core.algorithms import format_duration, best_video, get_resolution
 from vodd.core.constants import MediaName
 from vodd.core.exceptions import *
 from vodd.core.files import TEMP_DIR
@@ -198,7 +198,7 @@ class Downloader(object):
                 height=stream_info['height'] or 0,
                 resolution=get_resolution(stream_info['width'], stream_info['height']),
                 bandwidth=0,
-                framerate=convert_to_num(stream_info['r_frame_rate']) or 0,
+                framerate=0,
                 codecs='',
                 mime_type=MediaName.video,
             )])
