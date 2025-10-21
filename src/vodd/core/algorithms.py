@@ -3,9 +3,19 @@
 # @Time        : 2025/7/18 17:47
 # @Version     : Python 3.6.8
 from typing import List
+from urllib.parse import urlparse
+
+import m3u8
 
 from vodd.core.exceptions import *
 from vodd.core.models import VideoMedia
+
+
+def parse_m3u8(content: str, url: str = None) -> m3u8.M3U8:
+    media = m3u8.loads(content)
+    if url is not None:
+        media.base_uri = url.replace(urlparse(url).query, '').strip('?').rsplit('/', 1)[0] + '/'
+    return media
 
 
 def format_duration(seconds: float) -> str:
@@ -46,7 +56,7 @@ def best_video(medias: List[VideoMedia], **kwargs) -> VideoMedia:
         if all(not media[k] or v[1] <= media[k] <= v[2] for k, v in rules.items())
     ]
     if not allowed_medias:
-        raise UnsupportedError(f'没有符合要求的视频：{', '.join([f'{k}={v[2]}' for k, v in rules.items()])}')
+        raise UnsupportedError(f'没有符合要求的视频：{', '.join([f'{k}={v[0]}' for k, v in rules.items()])}')
     media = allowed_medias[0]
     for key in rules:
         if media[key]:

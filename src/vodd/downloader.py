@@ -19,11 +19,11 @@ import requests
 import urllib3
 from prettytable import PrettyTable
 
-from vodd.core.algorithms import format_duration
+from vodd.core.algorithms import format_duration, best_video, convert_to_num, get_resolution
 from vodd.core.constants import MediaName
 from vodd.core.exceptions import *
 from vodd.core.files import TEMP_DIR
-from vodd.core.models import Segment
+from vodd.core.models import Segment, VideoMedia
 from vodd.plugins import get_all_plugins
 from vodd.plugins.__base_plugin__ import BasePlugin
 from vodd.utils.request_adapter import get_request_kwargs
@@ -188,7 +188,19 @@ class Downloader(object):
             self.core.add_segments_path()
             logger.info(f'总任务数：{len(self.tasks)}')
             self.core.classify()
-            logger.info(f'探测到视频格式: {json.dumps(self.core.probe(self.tasks[0]), ensure_ascii=False)}')
+            stream_info = self.core.probe(self.tasks[0])
+            logger.info(f'探测到视频格式: {json.dumps(stream_info, ensure_ascii=False)}')
+            # 通过探测结果再次筛选视频
+            best_video([VideoMedia(
+                index=stream_info['index'],
+                data='',
+                height=stream_info['height'] or 0,
+                resolution=get_resolution(stream_info['width'], stream_info['height']),
+                bandwidth=0,
+                framerate=convert_to_num(stream_info['r_frame_rate']) or 0,
+                codecs='',
+                mime_type=MediaName.video,
+            )])
             self.download_inits()
             self.concurrent()
             if self.is_all_confirmed:
@@ -228,9 +240,18 @@ class DownloadCore(object):
     def get_suitable_plugin(self) -> BasePlugin:
         if not (name := self.downloader.kwargs.get('name')):
             resp = self.downloader.requester('head', self.downloader.kwargs['url'])
-            if "mpegurl" in (ctype := resp.headers.get("Content-Type", "").lower()) or "m3u8" in ctype:
+            suffix = Path(urlparse(resp.url).path).suffix.lower()
+            if (
+                    "mpegurl" in (ctype := resp.headers.get("Content-Type", "").lower())
+                    or "m3u8" in ctype
+                    or ".m3u8" == suffix
+            ):
                 name = "hls"
-            elif "dash+xml" in ctype or "mpd" in ctype:
+            elif (
+                    "dash+xml" in ctype
+                    or "mpd" in ctype
+                    or ".mpd" == suffix
+            ):
                 name = "dash"
             elif ctype.startswith("video/") or "octet-stream" in ctype:
                 # 对于视频类型、二进制流，默认认为可直接下载
@@ -250,6 +271,7 @@ class DownloadCore(object):
             url = segment.url
             filepath = segment.filepath
         self.downloader.smart_save(url, segment.headers, filepath)
+        self.downloader.plugin.decrypt(segment).rename(segment.filepath)
         resp = self.downloader.requester('head', segment.url)
         if (
                 resp.headers.get('Accept-Ranges', '').lower() == 'bytes'
@@ -258,10 +280,14 @@ class DownloadCore(object):
         ):
             self.downloader.chunked_mode = True
         command = f'ffprobe -v error -select_streams v:0 -show_entries stream=index,codec_type,width,height,codec_name,r_frame_rate,bit_rate,duration -of json "{filepath.as_posix()}"'
-        meta = json.loads(os.popen(command).read().strip())
-        if not (streams := meta['streams']):
-            streams = meta['programs'][0]['streams']
-        return streams[0]
+        try:
+            meta = json.loads(os.popen(command).read().strip())
+            if not (streams := meta['streams']):
+                streams = meta['programs'][0]['streams']
+            stream_info = streams[0]
+        except Exception:
+            raise UnsupportedError(f'无法探测媒体信息，视频内容错误')
+        return stream_info
 
     def classify(self):
         self.downloader.tasks.sort(key=lambda x: (MediaName.index(x.type), x.group_no, x.index))
@@ -343,7 +369,7 @@ class DownloadCore(object):
                 else:
                     row = [f.index, f.language, f.label, f.audio_sampling_rate, f.codecs, f.mime_type]
                 table.add_row(row)
-        logger.info(f'可选择的格式有：{table}')
+        logger.info(f'可选择的格式有：\n{table}')
 
         formats = self.downloader.plugin.select_formats(available_formats)
         shows = {}

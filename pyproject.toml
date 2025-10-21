@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vodd"
-version = "1.0.0"
+version = "1.1.0"
 description = "VOD Downloader"
 authors = [
     { name = "lijinquan123", email = "3291742120@qq.com" }
@@ -19,6 +19,7 @@ dependencies = [
     "DRM @ git+https://github.com/lijinquan123/DRM.git",
     "isodate>=0.7.2",
     "lxml>=6.0.2",
+    "m3u8>=6.0.0",
     "prettytable>=3.16.0",
     "pydantic>=2.12.0",
     "requests>=2.32.5",

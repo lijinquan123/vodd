@@ -5,7 +5,6 @@
 import base64
 import copy
 import logging
-import threading
 from pathlib import Path
 from typing import List
 
@@ -13,7 +12,7 @@ from DRM import mp4parse, decrypter
 from DRM.widevine.cdm import ContentDecryptionModules
 from DRM.widevine.oemcrypto import OEMCrypto
 
-from vodd.core.algorithms import convert_to_num, best_video, get_resolution
+from vodd.core.algorithms import convert_to_num, get_resolution
 from vodd.core.constants import SUPPORTED_DRM_CIPHERS, MediaName
 from vodd.core.exceptions import *
 from vodd.core.models import Segment, VideoMedia, AudioMedia
@@ -30,7 +29,6 @@ class DASH(BasePlugin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.drm_key_content = ''
-        self._drm_lock = threading.RLock()
 
     def pre_checker(self, segment: Segment):
         if segment.cipher.name:
@@ -52,6 +50,56 @@ class DASH(BasePlugin):
         resp = self.downloader.requester(**kwargs)
         return resp.content
 
+    def get_formats(self) -> dict:
+        resp = self.downloader.requester('GET', self.downloader.kwargs['url'])
+        mpd = Parser.from_string(resp.text, resp.url)
+        if (c := len(mpd.periods)) > 1:
+            raise UnsupportedError(f'暂不支持多个Period: {c}')
+        representations = get_representations(mpd.periods[0].adaptation_sets)
+        if MediaName.video not in representations:
+            raise NotFoundError(f'未找到视频：{list(representations)}')
+
+        # 获取视频
+        videos = []
+        for index, stream_info in enumerate(representations[MediaName.video]):
+            videos.append(VideoMedia(
+                index=index,
+                data=stream_info,
+                height=stream_info.height or 0,
+                resolution=get_resolution(stream_info.width, stream_info.height),
+                bandwidth=stream_info.bandwidth or 0,
+                framerate=convert_to_num(stream_info.frame_rate) or 0,
+                codecs=stream_info.codecs or '',
+                mime_type=stream_info.mime_type or '',
+            ))
+
+        # 获取音频
+        audios = []
+        for index, audio in enumerate(representations.get(MediaName.audio) or [], start=len(videos)):
+            audios.append(AudioMedia(
+                index=index,
+                data=audio,
+                id=audio.id,
+                language=audio.parent.lang or '',
+                label=audio.parent.label or '',
+                codecs=audio.codecs or '',
+                audio_sampling_rate=audio.audio_sampling_rate or '',
+                mime_type=audio.mime_type or '',
+            ))
+        formats = {
+            MediaName.video: videos,
+        }
+        if audios:
+            formats[MediaName.audio] = audios
+        return formats
+
+    def get_segments(self, formats: dict) -> List[Segment]:
+        segments = get_video_segments(formats[MediaName.video][0].data)
+        self.pre_checker(segments[0])
+        for ass in get_audios_segments([f.data for f in formats.get(MediaName.audio) or []]):
+            segments.extend(ass)
+        return segments
+
     def decrypt(self, segment: Segment) -> Path:
         if segment.cipher.name:
             if segment.cipher.name not in SUPPORTED_DRM_CIPHERS:
@@ -59,7 +107,7 @@ class DASH(BasePlugin):
             encrypt_file = segment.filepath
             try:
                 if not self.drm_key_content:
-                    with self._drm_lock:
+                    with self._lock:
                         # 双重检查，防止重复进入
                         if not self.drm_key_content:
                             logger.warning(f'正在请求DRM密钥')
@@ -93,61 +141,4 @@ class DASH(BasePlugin):
                 return decrypt_file
             finally:
                 self.downloader.remove(encrypt_file)
-        elif segment.init_path:
-            segment.filepath.write_bytes(segment.init_path.read_bytes() + segment.filepath.read_bytes())
         return segment.filepath
-
-    def get_segments(self, formats: dict) -> List[Segment]:
-        segments = get_video_segments(formats[MediaName.video][0].data)
-        self.pre_checker(segments[0])
-        for ass in get_audios_segments([f.data for f in formats[MediaName.audio]]):
-            segments.extend(ass)
-        return segments
-
-    def get_formats(self) -> dict:
-        resp = self.downloader.requester('GET', self.downloader.kwargs['url'])
-        mpd = Parser.from_string(resp.text, resp.url)
-        if (c := len(mpd.periods)) > 1:
-            raise UnsupportedError(f'暂不支持多个Period: {c}')
-        representations = get_representations(mpd.periods[0].adaptation_sets)
-        if MediaName.video not in representations:
-            raise NotFoundError(f'未找到视频：{list(representations)}')
-
-        # 获取视频
-        videos = []
-        for index, video in enumerate(representations[MediaName.video]):
-            videos.append(VideoMedia(
-                index=index,
-                data=video,
-                height=video.height or 0,
-                resolution=get_resolution(video.width, video.height),
-                bandwidth=video.bandwidth or 0,
-                framerate=convert_to_num(video.frame_rate) or 0,
-                codecs=video.codecs or '',
-                mime_type=video.mime_type or '',
-            ))
-
-        # 获取音频
-        audios = []
-        for index, audio in enumerate(representations[MediaName.audio], start=len(videos)):
-            audios.append(AudioMedia(
-                index=index,
-                data=audio,
-                id=audio.id,
-                language=audio.parent.lang or '',
-                label=audio.parent.label or '',
-                codecs=audio.codecs or '',
-                audio_sampling_rate=audio.audio_sampling_rate or '',
-                mime_type=audio.mime_type or '',
-            ))
-        formats = {
-            MediaName.video: videos,
-        }
-        if audios:
-            formats[MediaName.audio] = audios
-        return formats
-
-    def select_formats(self, formats: dict) -> dict:
-        video = best_video(formats[MediaName.video], **self.downloader.kwargs)
-        formats[MediaName.video] = [video]
-        return formats
