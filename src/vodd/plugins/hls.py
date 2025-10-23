@@ -102,6 +102,7 @@ class HLS(BasePlugin):
                 cipher=cipher,
                 url=segment.absolute_uri,
                 duration=segment.duration,
+                discontinuity=segment.discontinuity,
                 init_url=init_url or '',
             ))
         return segments

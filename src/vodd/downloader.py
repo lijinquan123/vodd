@@ -8,6 +8,8 @@ import math
 import os
 import shutil
 import subprocess
+import sys
+import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -55,6 +57,7 @@ class Downloader(object):
         self.max_download_times = kwargs['max_download_times']
         self.chunk_size = kwargs['chunk_size']
         self.max_segment_size = kwargs['max_segment_size']
+        self.chunk_file_size = kwargs['chunk_file_size']
         # 控制参数
         self.chunked_mode = False
         self.is_stop_all = False
@@ -68,6 +71,7 @@ class Downloader(object):
         self.error = ''
         self.plugin: BasePlugin | None = None
         self.concat_paths = defaultdict(lambda: [])
+        self.downloaded_size = defaultdict(lambda: [0, 0])
 
     def requester(self, method: str, url: str, **kwargs):
         code = None
@@ -113,7 +117,7 @@ class Downloader(object):
         :return:
         """
         with ThreadPoolExecutor(max_workers=self.threads_num) as executor:
-            list(executor.map(self.download, [task for task in self.tasks if task.confirmed is False]))
+            list(executor.map(self.download, self.tasks))
 
     def download_inits(self):
         for mt, keys in self.inits.items():
@@ -146,29 +150,60 @@ class Downloader(object):
             self.is_stop_all = True
             logger.error(f'下载任务异常: {e}')
 
-    def smart_save(self, url: str, headers: dict, path: Path):
+    def smart_save(self, url: str, headers: dict, path: Path, ):
         rk = {}
         if headers:
             rk['headers'] = headers
+        self.downloaded_size.pop(path.name, None)
         if self.chunked_mode:
             st_time = time.time()
-            with self.requester('get', url, stream=True, **rk) as resp, open(path, 'ab') as f:
+            with self.requester('get', url, stream=True, **rk) as resp, open(path, 'wb') as f:
+                self.downloaded_size[path.name][1] = int(resp.headers.get('Content-Length', 0))
                 for chunk in resp.iter_content(self.chunk_size):
                     f.write(chunk)
-                    f.flush()
+                    self.downloaded_size[path.name][0] += len(chunk)
                     if (
                             (duration := time.time() - self.start_time) > self.overall_timeout
                             or (duration := time.time() - st_time) > self.per_timeout
                     ):
+                        self.downloaded_size.pop(path.name, None)
                         logger.warning(f'下载已超时：{int(duration)}, 终止程序运行')
                         raise ReachMaxDownloadLimitError(f'timeout: {int(duration)}')
         else:
             resp = self.requester('get', url, **rk)
             path.write_bytes(resp.content)
+            self.downloaded_size[path.name] = [len(resp.content), len(resp.content)]
 
     def wipe(self):
         logger.info(f'删除缓存文件夹: {self.temp_dir}')
         shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def watchdog(self):
+        while True:
+            if self.is_stop_all or self.is_all_confirmed:
+                sys.stdout.write("\n")
+                break
+            try:
+                downloadeds = 0
+                totals = 0
+                for d, t in self.downloaded_size.values():
+                    downloadeds += d
+                    totals += t
+                cost = int(time.time() - self.start_time)
+                download_num = max(len(self.downloaded_size), 1)
+                max_num = max(len(self.tasks), len(self.downloaded_size))
+                predicted_cost = int(totals / (downloadeds or 1) * cost * max_num / download_num)
+                # 耗时使用00:00, 文件大小使用MB, 速度使用MB/s
+                sys.stdout.write(
+                    f"\r{time.strftime('%Y-%m-%d %H:%M:%S')} "
+                    f"耗时: {format_duration(cost)}, 预估总耗时: {format_duration(predicted_cost)}, 速度: {downloadeds / 1024 / 1024 / cost:.2f}MB/s, "
+                    f"{downloadeds / (totals or 1) * 100:6.2f}%({round(downloadeds / 1024 / 1024, 1)}MB/{round(totals / 1024 / 1024, 1)}MB), "
+                    f"{download_num / max_num * 100:6.2f}%({download_num}/{max_num})"
+                )
+                sys.stdout.flush()
+            except Exception as e:
+                logger.exception(e)
+            time.sleep(1)
 
     def start(self):
         """
@@ -201,9 +236,11 @@ class Downloader(object):
                 framerate=0,
                 codecs='',
                 mime_type=MediaName.video,
-            )])
+            )], **self.kwargs)
             self.download_inits()
+            threading.Thread(target=self.watchdog).start()
             self.concurrent()
+            time.sleep(1)
             if self.is_all_confirmed:
                 self.core.concat()
                 self.core.merge()
@@ -211,21 +248,12 @@ class Downloader(object):
                 raise DownloadTaskError('未全部下载完成')
         except DownloadException as e:
             logger.error(f'下载异常: {e}')
-            self.error = f'[{e.message}]{e.reason}'
+            if not self.error:
+                self.error = f'[{e.message}]{e.reason}'
         except Exception as e:
             logger.exception(f'下载异常, 终止程序运行: {e}')
-            self.error = str(e)
-        else:
-            cost = int(time.time() - self.start_time)
-            size = round(self.save_path.stat().st_size / 1024 / 1024, 2)
-            # 耗时使用00:00, 文件大小使用MB, 速度使用MB/s
-            logger.info(
-                f'下载完成, '
-                f'耗时: {format_duration(cost)}, '
-                f'文件大小: {size}MB, '
-                f'速度: {size / cost:.2f}MB/s, '
-                f'文件已保存到{self.save_path.as_posix()}'
-            )
+            if not self.error:
+                self.error = str(e)
         self.wipe()
         return {
             'error': self.error,

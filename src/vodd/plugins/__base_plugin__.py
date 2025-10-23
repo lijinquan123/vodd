@@ -25,12 +25,6 @@ class BasePlugin(metaclass=abc.ABCMeta):
     def get_formats(self) -> dict:
         """获取格式"""
 
-    def select_formats(self, formats: dict) -> dict:
-        """选择格式"""
-        video = best_video(formats[MediaName.video], **self.downloader.kwargs)
-        formats[MediaName.video] = [video]
-        return formats
-
     @abc.abstractmethod
     def get_segments(self, formats: dict) -> List[Segment]:
         """获取切片"""
@@ -38,3 +32,9 @@ class BasePlugin(metaclass=abc.ABCMeta):
     @abc.abstractmethod
     def decrypt(self, segment: Segment) -> Path:
         """解密切片"""
+
+    def select_formats(self, formats: dict) -> dict:
+        """选择格式"""
+        video = best_video(formats[MediaName.video], **self.downloader.kwargs)
+        formats[MediaName.video] = [video]
+        return formats

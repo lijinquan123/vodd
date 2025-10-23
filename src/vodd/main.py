@@ -38,9 +38,9 @@ def main():
     plugin.add_argument('--framerate', required=False, type=commalist, dest='framerate', default='25,0,120',
                         help='优先选择的帧率')
     download = parser.add_argument_group('download')
-    download.add_argument('--per-timeout', type=int, default=3 * 60, required=False, dest='per_timeout',
+    download.add_argument('--per-timeout', type=int, default=20 * 60, required=False, dest='per_timeout',
                           help='单个切片超时时间')
-    download.add_argument('--overall-timeout', type=int, default=1 * 60 * 60, required=False, dest='overall_timeout',
+    download.add_argument('--overall-timeout', type=int, default=2 * 60 * 60, required=False, dest='overall_timeout',
                           help='总体超时时间')
     download.add_argument('--max-download-times', type=int, default=3, required=False, dest='max_download_times',
                           help='最大下载次数')
@@ -48,6 +48,8 @@ def main():
                           help='请求或者文件保存时的分块大小')
     download.add_argument('--max-segment-size', type=int, default=20 * 1024 * 1024, required=False,
                           dest='max_segment_size', help='最大的切片大小,超过此值时,必须使用分块模式,防止占用内存过大')
+    download.add_argument('--chunk-file-size', type=int, default=200 * 1024 * 1024, required=False,
+                          dest='chunk_file_size', help='分块文件大小')
 
     error_code = 0
     try:
