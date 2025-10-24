@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vodd"
-version = "1.2.0"
+version = "1.2.1"
 description = "VOD Downloader"
 authors = [
     { name = "lijinquan123", email = "3291742120@qq.com" }

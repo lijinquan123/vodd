@@ -116,9 +116,7 @@ class HLS(BasePlugin):
     def decrypt(self, segment: Segment) -> Path:
         if segment.cipher.name:
             if 'url' in segment.cipher.params:
-                if (url := segment.cipher.params['url']) in self.keys:
-                    key = self.keys[url]
-                else:
+                if (url := segment.cipher.params['url']) not in self.keys:
                     with self._lock:
                         if url not in self.keys:
                             resp = self.downloader.requester('GET', url)
@@ -127,6 +125,8 @@ class HLS(BasePlugin):
                                 logger.warning(f'添加加密key: {url=}, {key=}')
                             else:
                                 raise NotFoundError(f'获取key失败: {key=}')
+                if url in self.keys:
+                    key = self.keys[url]
             elif 'key' in segment.cipher.params:
                 key = segment.cipher.params['key']
             # 64字节key
