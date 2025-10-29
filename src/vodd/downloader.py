@@ -31,23 +31,18 @@ from vodd.plugins.__base_plugin__ import BasePlugin
 from vodd.utils.request_adapter import get_request_kwargs
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(filename)s line:%(lineno)d %(process)d-%(threadName)s-%(thread)d %(levelname)-8s %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-)
 
 
 class Downloader(object):
 
-    def __init__(self, save_path: str, speed: int = 5, **kwargs):
+    def __init__(self, save_path: str, rate: int = 5, **kwargs):
         if ffmpeg_path := shutil.which('ffmpeg'):
             self.ffmpeg_path = ffmpeg_path
         else:
             raise FFmpegNotFoundError('找不到FFmpeg程序,当前程序即刻停止')
         # 必须参数
         self.save_path = Path(save_path)
-        self.threads_num = math.ceil(speed)
+        self.threads_num = math.ceil(rate)
         self.kwargs = kwargs
         # 可选参数
         self.temp_dir = TEMP_DIR / md5(self.save_path.as_posix().encode('utf-8')).hexdigest()
@@ -68,7 +63,7 @@ class Downloader(object):
         self.tasks = []
         self.segments = defaultdict(lambda: defaultdict(list))
         self.inits = defaultdict(lambda: {})
-        self.error = ''
+        self.error = {}
         self.plugin: BasePlugin | None = None
         self.concat_paths = defaultdict(lambda: [])
         self.downloaded_size = defaultdict(lambda: [0, 0])
@@ -128,7 +123,7 @@ class Downloader(object):
                     self.smart_save(segment.init_url, segment.headers, segment.init_path)
                 except DownloadException as e:
                     self.is_stop_all = True
-                    self.error = f'[{e.message}]{e.reason}'
+                    self.error = e.__dict__
                 except Exception as e:
                     self.is_stop_all = True
                     logger.error(f'下载元数据异常: {mt}.{key[0]}, {e}')
@@ -145,7 +140,7 @@ class Downloader(object):
             self.plugin.decrypt(task).rename(task.filepath)
         except DownloadException as e:
             self.is_stop_all = True
-            self.error = f'[{e.message}]{e.reason}'
+            self.error = e.__dict__
         except Exception as e:
             self.is_stop_all = True
             logger.error(f'下载任务异常: {e}')
@@ -249,11 +244,11 @@ class Downloader(object):
         except DownloadException as e:
             logger.error(f'下载异常: {e}')
             if not self.error:
-                self.error = f'[{e.message}]{e.reason}'
+                self.error = e.__dict__
         except Exception as e:
             logger.exception(f'下载异常, 终止程序运行: {e}')
             if not self.error:
-                self.error = str(e)
+                self.error = {'message': 'Exception', 'reason': str(e)}
         self.wipe()
         return {
             'error': self.error,
@@ -267,7 +262,7 @@ class DownloadCore(object):
         self.downloader = downloader
 
     def get_suitable_plugin(self) -> BasePlugin:
-        if not (name := self.downloader.kwargs.get('name')):
+        if not (name := self.downloader.kwargs.get('plugin', '').lower()):
             resp = self.downloader.requester('head', self.downloader.kwargs['url'])
             suffix = Path(urlparse(resp.url).path).suffix.lower()
             if (
