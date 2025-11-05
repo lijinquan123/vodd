@@ -25,8 +25,44 @@ class NotFoundError(DownloadException):
     """未找到错误"""
 
 
+class CheckError(DownloadException):
+    """检查错误"""
+
+
+class CheckVideoError(DownloadException):
+    """检查视频错误"""
+
+
+class DTSCheckError(CheckVideoError):
+    """DTS检查错误"""
+
+
 class UnsupportedError(DownloadException):
     """不支持的错误"""
+
+
+class ResolutionTooHighError(CheckVideoError):
+    """分辨率过高错误"""
+
+
+class ResolutionTooLowError(CheckVideoError):
+    """分辨率过低错误"""
+
+
+class BandwidthTooHighError(CheckVideoError):
+    """带宽过高错误"""
+
+
+class BandwidthTooLowError(CheckVideoError):
+    """带宽过低错误"""
+
+
+class FramerateTooHighError(CheckVideoError):
+    """帧率过高错误"""
+
+
+class FramerateTooLowError(CheckVideoError):
+    """帧率过低错误"""
 
 
 class SoftwareError(DownloadException):

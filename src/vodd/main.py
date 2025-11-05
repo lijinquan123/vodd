@@ -29,7 +29,7 @@ def build_parser():
     parser.add_argument('-r', type=float, default=5, dest='rate', help='下载速度,实际上会略小于当前值')
 
     downloader = parser.add_argument_group('downloader')
-    downloader.add_argument('-p', type=str, dest='plugin', help='插件名字')
+    downloader.add_argument('-p', type=str, dest='plugin', default='', help='插件名字')
     downloader.add_argument('--url', type=str, dest='url', help='播放链接')
     downloader.add_argument('--headers', dest='headers', type=jsonloads, help='播放使用的请求头')
     downloader.add_argument('--drm-request', dest='drm_request', type=jsonloads, help='请求DRM许可使用的请求数据')
@@ -45,6 +45,8 @@ def build_parser():
                             help='最大的切片大小,超过此值时,必须使用分块模式,防止占用内存过大')
     downloader.add_argument('--chunk-file-size', type=int, default=200 * 1024 * 1024, dest='chunk_file_size',
                             help='分块文件大小')
+    downloader.add_argument('--segment-size', type=int, default=0, dest='segment_size',
+                            help='下载切片的数量，默认全部下载')
 
     selector = parser.add_argument_group('selector')
     selector.add_argument('--height', type=commalist, dest='height', default='1080,480,1080',

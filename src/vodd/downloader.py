@@ -21,11 +21,11 @@ import requests
 import urllib3
 from prettytable import PrettyTable
 
-from vodd.core.algorithms import format_duration, best_video, get_resolution
+from vodd.core.algorithms import format_duration, convert_to_num, check_video, check_dts
 from vodd.core.constants import MediaName
 from vodd.core.exceptions import *
-from vodd.core.files import TEMP_DIR
-from vodd.core.models import Segment, VideoMedia
+from vodd.core.files import TEMP_DIR, ERROR_DIR
+from vodd.core.models import Segment
 from vodd.plugins import get_all_plugins
 from vodd.plugins.__base_plugin__ import BasePlugin
 from vodd.utils.request_adapter import get_request_kwargs
@@ -53,6 +53,7 @@ class Downloader(object):
         self.chunk_size = kwargs['chunk_size']
         self.max_segment_size = kwargs['max_segment_size']
         self.chunk_file_size = kwargs['chunk_file_size']
+        self.segment_size = kwargs['segment_size']
         # 控制参数
         self.chunked_mode = False
         self.is_stop_all = False
@@ -215,23 +216,14 @@ class Downloader(object):
             self.plugin = self.core.get_suitable_plugin()
             logger.info(f'使用插件：{self.plugin.__class__.__name__}')
             formats = self.core.select()
-            self.tasks = self.plugin.get_segments(formats)
+            segments = self.plugin.get_segments(formats)
+            if self.segment_size:
+                segments = segments[:self.segment_size]
+            self.tasks = segments
             self.core.add_segments_path()
             logger.info(f'总任务数：{len(self.tasks)}')
             self.core.classify()
-            stream_info = self.core.probe(self.tasks[0])
-            logger.info(f'探测到视频格式: {json.dumps(stream_info, ensure_ascii=False)}')
-            # 通过探测结果再次筛选视频
-            best_video([VideoMedia(
-                index=stream_info['index'],
-                data='',
-                height=stream_info['height'] or 0,
-                resolution=get_resolution(stream_info['width'], stream_info['height']),
-                bandwidth=0,
-                framerate=0,
-                codecs='',
-                mime_type=MediaName.video,
-            )], **self.kwargs)
+            self.core.check_video(self.core.pre_download(self.tasks[0]))
             self.download_inits()
             threading.Thread(target=self.watchdog).start()
             self.concurrent()
@@ -241,6 +233,9 @@ class Downloader(object):
                 self.core.merge()
             else:
                 raise DownloadTaskError('未全部下载完成')
+            if self.save_path.exists():
+                self.core.check_video(self.save_path, full=True)
+                check_dts(self.save_path)
         except DownloadException as e:
             logger.error(f'下载异常: {e}')
             if not self.error:
@@ -250,6 +245,10 @@ class Downloader(object):
             if not self.error:
                 self.error = {'message': 'Exception', 'reason': str(e)}
         self.wipe()
+        if self.error and self.save_path.exists():
+            error_file = ERROR_DIR / self.save_path.name
+            logger.error(f'将文件移动到错误文件夹: {error_file.as_posix()}')
+            shutil.move(self.save_path.as_posix(), error_file.as_posix())
         return {
             'error': self.error,
             'save_path': self.save_path.as_posix(),
@@ -286,8 +285,26 @@ class DownloadCore(object):
             raise UnsupportedError(f'没有找到插件: {name}')
         return plugins[name](downloader=self.downloader)
 
-    def probe(self, segment: Segment) -> dict:
-        """获取媒资信息"""
+    def check_video(self, filepath: Path, full: bool = False):
+        command = f'ffprobe -v error -select_streams v:0 -show_entries "stream=index,codec_type,width,height,codec_name,r_frame_rate,bit_rate,duration:format=bit_rate" -of json "{filepath.as_posix()}"'
+        try:
+            meta = json.loads(os.popen(command).read().strip())
+            if not (streams := meta['streams']):
+                streams = meta['programs'][0]['streams']
+            stream_info = streams[0]
+        except KeyError, Exception:
+            raise CheckVideoError(f'无法探测媒体信息，视频内容错误')
+        logger.info(f'探测到视频格式: {json.dumps(meta, ensure_ascii=False)}')
+        # 通过探测结果再次筛选视频
+        video = {
+            "v_height": stream_info['height'] or 0,
+        }
+        if full:
+            video['v_framerate'] = convert_to_num(stream_info['r_frame_rate']) or 0
+            video['v_bandwidth'] = convert_to_num(meta['format']['bit_rate'])
+        check_video(**video, **self.downloader.kwargs)
+
+    def pre_download(self, segment: Segment) -> Path:
         if segment.init_url:
             url = segment.init_url
             filepath = segment.init_path
@@ -304,15 +321,7 @@ class DownloadCore(object):
                 and int(resp.headers['Content-Length']) > self.downloader.max_segment_size
         ):
             self.downloader.chunked_mode = True
-        command = f'ffprobe -v error -select_streams v:0 -show_entries stream=index,codec_type,width,height,codec_name,r_frame_rate,bit_rate,duration -of json "{filepath.as_posix()}"'
-        try:
-            meta = json.loads(os.popen(command).read().strip())
-            if not (streams := meta['streams']):
-                streams = meta['programs'][0]['streams']
-            stream_info = streams[0]
-        except Exception:
-            raise UnsupportedError(f'无法探测媒体信息，视频内容错误')
-        return stream_info
+        return filepath
 
     def classify(self):
         self.downloader.tasks.sort(key=lambda x: (MediaName.index(x.type), x.group_no, x.index))

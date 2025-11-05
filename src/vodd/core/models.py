@@ -36,7 +36,7 @@ class VideoMedia(BaseModel):
     data: Any = ''
     height: int = 0
     resolution: str = ''
-    bandwidth: int = 0
+    bandwidth: float = 0
     framerate: float = 0
     codecs: str = ''
     mime_type: str = ''

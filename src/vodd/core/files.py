@@ -5,3 +5,5 @@
 from pathlib import Path
 
 TEMP_DIR = Path('/home/www/tmp/vodd/')
+ERROR_DIR = Path('/home/www/tmp/vodd/error')
+ERROR_DIR.mkdir(parents=True, exist_ok=True)
