@@ -75,9 +75,9 @@ def main(argv: list = None):
             if v == parser.get_default(k):
                 continue
             logger.info(f'{k}: {v}')
-        if error := (data := Downloader(**kwargs).start())['error']:
+        if (data := Downloader(**kwargs).start())['error']:
             error_code = 1
-        print(f'{json.dumps(data, ensure_ascii=False)}', file=[sys.stdout, sys.stderr][bool(error)])
+        print(f'{json.dumps(data, ensure_ascii=False)}', file=sys.stderr)
     except KeyboardInterrupt:
         error_code = 130
     except Exception:
