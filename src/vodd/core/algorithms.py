@@ -105,6 +105,8 @@ def check_dts(filepath: Path):
     duration = 0
     prev_dts = 0
     for frame in p.stdout.strip().split('\n'):
+        if not frame.strip():
+            continue
         pts, pts_time, dts, dts_time, duration_time = frame.strip(',').split(',')
         try:
             dts = float(dts)

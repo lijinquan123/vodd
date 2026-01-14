@@ -190,7 +190,7 @@ class Downloader(object):
                 for d, t in self.downloaded_size.values():
                     downloadeds += d
                     totals += t
-                cost = int(time.time() - self.start_time)
+                cost = max(time.time() - self.start_time, 0.05)
                 download_num = max(len(self.downloaded_size), 1)
                 max_num = max(len(self.tasks), len(self.downloaded_size))
                 predicted_cost = int(totals / (downloadeds or 1) * cost * max_num / download_num)
