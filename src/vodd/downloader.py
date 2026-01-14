@@ -2,6 +2,7 @@
 # @Author      : LJQ
 # @Time        : 2025/9/16 11:01
 # @Version     : Python 3.13.7
+import copy
 import json
 import logging
 import math
@@ -21,10 +22,10 @@ import requests
 import urllib3
 from prettytable import PrettyTable
 
-from vodd.core.algorithms import format_duration, convert_to_num, check_video, check_dts
+from vodd.core.algorithms import check_dts, check_video, convert_to_num, format_duration
 from vodd.core.constants import MediaName
 from vodd.core.exceptions import *
-from vodd.core.files import TEMP_DIR, ERROR_DIR
+from vodd.core.files import ERROR_DIR, TEMP_DIR
 from vodd.core.models import Segment
 from vodd.plugins import get_all_plugins
 from vodd.plugins.__base_plugin__ import BasePlugin
@@ -73,7 +74,11 @@ class Downloader(object):
         code = None
         for i in range(self.max_download_times):
             try:
-                if (resp := self.session.request(method, url, **{**self.request_kwargs, **kwargs})).ok:
+                r_headers = (crk := copy.deepcopy(self.request_kwargs)).get('headers', {})
+                k_headers = (ck := copy.deepcopy(kwargs)).pop('headers', {})
+                r_headers.update(k_headers)
+                crk.update(ck)
+                if (resp := self.session.request(method, url, **crk)).ok:
                     break
                 code = resp.status_code
             except requests.exceptions.SSLError:

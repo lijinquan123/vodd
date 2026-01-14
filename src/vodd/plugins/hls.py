@@ -10,10 +10,10 @@ from typing import List
 import m3u8
 from Crypto.Cipher import AES
 
-from vodd.core.algorithms import parse_m3u8, get_resolution, convert_to_num
+from vodd.core.algorithms import convert_to_num, get_resolution, parse_m3u8
 from vodd.core.constants import MediaName
 from vodd.core.exceptions import NotFoundError
-from vodd.core.models import VideoMedia, AudioMedia, Segment, Cipher
+from vodd.core.models import AudioMedia, Cipher, Segment, VideoMedia
 from vodd.plugins import BasePlugin
 
 logger = logging.getLogger(__name__)
@@ -95,12 +95,17 @@ class HLS(BasePlugin):
                     name=key.method,
                     params={"url": key.absolute_uri, "iv": iv},
                 )
+            headers = {}
+            if segment.byterange:
+                length, start = map(int, segment.byterange.split('@'))
+                headers['range'] = f'bytes={start}-{start + length - 1}'
             segments.append(Segment(
                 type=media_type,
                 group_no=group_no,
                 index=index,
                 cipher=cipher,
                 url=segment.absolute_uri,
+                headers=headers,
                 duration=segment.duration,
                 discontinuity=segment.discontinuity,
                 init_url=init_url or '',

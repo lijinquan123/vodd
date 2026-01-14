@@ -23,6 +23,7 @@ def get_representations(adaptation_sets: List[tags.AdaptationSet]) -> Dict[str, 
 
 def get_video_segments(representation: tags.Representation):
     # 拼接视频切片
+    # TODO: byterange
     segments = []
     cipher = get_cipher(representation.content_protections)
     for index, segment in enumerate(representation.segments):
