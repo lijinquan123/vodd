@@ -267,7 +267,10 @@ class DownloadCore(object):
 
     def get_suitable_plugin(self) -> BasePlugin:
         if not (name := self.downloader.kwargs.get('plugin', '').lower()):
-            resp = self.downloader.requester('head', self.downloader.kwargs['url'])
+            try:
+                resp = self.downloader.requester('head', self.downloader.kwargs['url'])
+            except requests.exceptions.HTTPError:
+                resp = self.downloader.requester('get', self.downloader.kwargs['url'])
             suffix = Path(urlparse(resp.url).path).suffix.lower()
             if (
                     "mpegurl" in (ctype := resp.headers.get("Content-Type", "").lower())
@@ -319,7 +322,10 @@ class DownloadCore(object):
         self.downloader.smart_save(url, segment.headers, filepath)
         if not segment.init_url:
             self.downloader.plugin.decrypt(segment).rename(segment.filepath)
-        resp = self.downloader.requester('head', segment.url)
+        try:
+            resp = self.downloader.requester('head', segment.url)
+        except requests.exceptions.HTTPError:
+            resp = self.downloader.requester('get', segment.url)
         if (
                 resp.headers.get('Accept-Ranges', '').lower() == 'bytes'
                 and 'Content-Length' in resp.headers
