@@ -269,7 +269,7 @@ class DownloadCore(object):
         if not (name := self.downloader.kwargs.get('plugin', '').lower()):
             try:
                 resp = self.downloader.requester('head', self.downloader.kwargs['url'])
-            except requests.exceptions.HTTPError:
+            except HTTPStatusCodeError:
                 resp = self.downloader.requester('get', self.downloader.kwargs['url'])
             suffix = Path(urlparse(resp.url).path).suffix.lower()
             if (
@@ -324,7 +324,7 @@ class DownloadCore(object):
             self.downloader.plugin.decrypt(segment).rename(segment.filepath)
         try:
             resp = self.downloader.requester('head', segment.url)
-        except requests.exceptions.HTTPError:
+        except HTTPStatusCodeError:
             resp = self.downloader.requester('get', segment.url)
         if (
                 resp.headers.get('Accept-Ranges', '').lower() == 'bytes'
