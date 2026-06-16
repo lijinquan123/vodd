@@ -284,8 +284,13 @@ class DownloadCore(object):
                     or ".mpd" == suffix
             ):
                 name = "dash"
-            elif ctype.startswith("video/") or "octet-stream" in ctype:
-                # 对于视频类型、二进制流，默认认为可直接下载
+            elif (
+                    ctype.startswith(("video/", "audio/", "application/"))
+                    or "octet-stream" in ctype
+                    or suffix in (".mp4", ".webm", ".ts", ".mkv", ".flv", ".mov",
+                                  ".mp3", ".aac", ".flac", ".ogg", ".wav", ".m4a")
+            ): 
+                # 对于视频、音频类型、二进制流，以及常见媒体后缀，默认认为可直接下载
                 name = "stream"
             else:
                 raise NotFoundError(f'没有找到合适的插件: {ctype}')
