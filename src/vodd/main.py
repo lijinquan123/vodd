@@ -10,7 +10,7 @@ import traceback
 from pathlib import Path
 
 from vodd.downloader import Downloader
-from vodd.utils.args import jsonloads, commalist
+from vodd.utils.args import commalist, jsonloads
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -27,6 +27,7 @@ def build_parser():
     parser.add_argument('-c', type=str, dest='config', help='从配置文件中读取所有参数,配置参数会覆盖命令参数')
     parser.add_argument('-o', type=str, dest='save_path', help='需要保存的路径')
     parser.add_argument('-r', type=float, default=5, dest='rate', help='下载速度,实际上会略小于当前值')
+    parser.add_argument("--duration-only", action=argparse.BooleanOptionalAction, default=False, help='只获取时长')
 
     downloader = parser.add_argument_group('downloader')
     downloader.add_argument('-p', type=str, dest='plugin', default='', help='插件名字')

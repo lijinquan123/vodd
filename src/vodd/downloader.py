@@ -49,6 +49,7 @@ class Downloader(object):
         self.temp_dir = TEMP_DIR / md5(self.save_path.as_posix().encode('utf-8')).hexdigest()
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.per_timeout = kwargs['per_timeout']
+        self.duration_only = kwargs['duration_only']
         self.overall_timeout = kwargs['overall_timeout']
         self.max_download_times = kwargs['max_download_times']
         self.chunk_size = kwargs['chunk_size']
@@ -217,13 +218,18 @@ class Downloader(object):
         """
         self.wipe()
         try:
-            self.temp_dir.mkdir(parents=True, exist_ok=True)
             self.plugin = self.core.get_suitable_plugin()
             logger.info(f'使用插件：{self.plugin.__class__.__name__}')
             formats = self.core.select()
             segments = self.plugin.get_segments(formats)
             if self.segment_size:
                 segments = segments[:self.segment_size]
+            if self.duration_only:
+                return {
+                    'error': self.error,
+                    'duration': round(sum(segment.duration or 0 for segment in segments), 2)
+                }
+            self.temp_dir.mkdir(parents=True, exist_ok=True)
             self.tasks = segments
             self.core.add_segments_path()
             logger.info(f'总任务数：{len(self.tasks)}')
@@ -289,7 +295,7 @@ class DownloadCore(object):
                     or "octet-stream" in ctype
                     or suffix in (".mp4", ".webm", ".ts", ".mkv", ".flv", ".mov",
                                   ".mp3", ".aac", ".flac", ".ogg", ".wav", ".m4a")
-            ): 
+            ):
                 # 对于视频、音频类型、二进制流，以及常见媒体后缀，默认认为可直接下载
                 name = "stream"
             else:
