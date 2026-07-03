@@ -45,11 +45,12 @@ class Downloader(object):
         self.save_path = Path(save_path)
         self.threads_num = math.ceil(rate)
         self.kwargs = kwargs
+        self.duration_only = kwargs['duration_only']
         # 可选参数
         self.temp_dir = TEMP_DIR / md5(self.save_path.as_posix().encode('utf-8')).hexdigest()
-        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        if not self.duration_only:
+            self.temp_dir.mkdir(parents=True, exist_ok=True)
         self.per_timeout = kwargs['per_timeout']
-        self.duration_only = kwargs['duration_only']
         self.overall_timeout = kwargs['overall_timeout']
         self.max_download_times = kwargs['max_download_times']
         self.chunk_size = kwargs['chunk_size']
@@ -177,8 +178,9 @@ class Downloader(object):
             self.downloaded_size[path.name] = [len(resp.content), len(resp.content)]
 
     def wipe(self):
-        logger.info(f'删除缓存文件夹: {self.temp_dir}')
-        shutil.rmtree(self.temp_dir, ignore_errors=True)
+        if not self.duration_only:
+            logger.info(f'删除缓存文件夹: {self.temp_dir}')
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def watchdog(self):
         while True:

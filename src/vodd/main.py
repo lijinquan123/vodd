@@ -25,7 +25,7 @@ def build_parser():
     # -o 1.ts --url "https://hk4-edge25-1.edgeware.tvb.com/manifest.mpd" --drm-request "{\"url\": \"https://prod-inews-wv.tvb.com/wvproxy/mlicense?contentid=20251016\"}" --drm-private-key-path "private_key.pem" --drm-client-id-path "client_id.bin"
     parser = argparse.ArgumentParser(usage='VOD Downloader', description='--help')
     parser.add_argument('-c', type=str, dest='config', help='从配置文件中读取所有参数,配置参数会覆盖命令参数')
-    parser.add_argument('-o', type=str, dest='save_path', help='需要保存的路径')
+    parser.add_argument('-o', type=str, dest='save_path', default='', help='需要保存的路径')
     parser.add_argument('-r', type=float, default=5, dest='rate', help='下载速度,实际上会略小于当前值')
     parser.add_argument("--duration-only", action=argparse.BooleanOptionalAction, default=False, help='只获取时长')
 
@@ -65,7 +65,7 @@ def main(argv: list = None):
         if argv is None:
             argv = sys.argv[1:]
         args, unknown = parser.parse_known_args(argv)
-        if not ((args.save_path and args.url) or args.config):
+        if not ((args.save_path and args.url) or args.config or args.duration_only):
             raise ValueError("缺少参数[--url,-o]或者[-c]")
         if args.config:
             # 将配置文件的参数重新赋值到命令参数中
