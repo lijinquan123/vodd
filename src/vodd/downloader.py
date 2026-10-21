@@ -33,6 +33,17 @@ from vodd.utils.request_adapter import get_request_kwargs
 
 logger = logging.getLogger(__name__)
 
+# 429通用处理: 主动节流 + 自适应冷却, 不额外暴露参数
+RATE_LIMIT_INITIAL_INTERVAL = 0.2  # 初始主动节流: 每请求间隔(秒), 即 5 请求/秒
+RATE_LIMIT_MIN_INTERVAL = 0.05  # 节流下限, 最快不超过 20 请求/秒
+RATE_LIMIT_MAX_INTERVAL = 60.0  # 节流上限, 最慢 1 请求/分钟
+RATE_LIMIT_INCREASE_FACTOR = 1.5  # 触发429时至少把间隔放大1.5倍
+RATE_LIMIT_DECREASE_FACTOR = 0.9  # 连续成功时每次把间隔缩小10%
+RATE_LIMIT_SUCCESS_STREAK = 30  # 连续成功多少个请求才放宽一次节流
+RATE_LIMIT_MAX_RETRIES = 20  # 单个请求最多经历多少次429
+RATE_LIMIT_MAX_COOLDOWN = 300  # 单次冷却时间上限(秒)
+RATE_LIMIT_MIN_COOLDOWN = 1  # 无Retry-After时的最小退避(秒)
+
 
 class Downloader(object):
 
@@ -71,17 +82,122 @@ class Downloader(object):
         self.plugin: BasePlugin | None = None
         self.concat_paths = defaultdict(lambda: [])
         self.downloaded_size = defaultdict(lambda: [0, 0])
+        # 429通用处理: 主动节流 + 自适应冷却, 所有线程共享同一把锁
+        self._rate_lock = threading.Lock()
+        self._cooldown_until = 0.0
+        self._cooldown_started = False
+        self._min_interval = RATE_LIMIT_INITIAL_INTERVAL
+        self._next_request_time = 0.0
+        self._success_streak = 0
+        self._since_429_requests = 0
+        self._since_429_start = 0.0
+
+    def _wait_cooldown(self):
+        """
+        冷却等待, 429之后所有线程统一停顿, 期间保持对终止标志和总超时的响应
+        """
+        while True:
+            if self.is_stop_all:
+                raise DownloadTaskError('下载已被终止')
+            if (duration := time.time() - self.start_time) > self.overall_timeout:
+                raise ReachMaxDownloadLimitError(f'timeout: {int(duration)}')
+            with self._rate_lock:
+                remain = self._cooldown_until - time.monotonic()
+                if remain <= 0:
+                    if self._cooldown_started:
+                        self._cooldown_started = False
+                        logger.warning('429冷却结束, 恢复下载')
+                    return
+            time.sleep(min(remain, 1.0))
+
+    def _throttle(self):
+        """
+        主动节流: 所有线程共享一个最小请求间隔, 使整体速率不超过 1/_min_interval
+        """
+        while True:
+            if self.is_stop_all:
+                raise DownloadTaskError('下载已被终止')
+            if (duration := time.time() - self.start_time) > self.overall_timeout:
+                raise ReachMaxDownloadLimitError(f'timeout: {int(duration)}')
+            with self._rate_lock:
+                now = time.monotonic()
+                wait = self._next_request_time - now
+                if wait <= 0:
+                    if not self._since_429_start:
+                        self._since_429_start = now
+                    self._next_request_time = now + self._min_interval
+                    return
+            time.sleep(min(wait, 0.1))
+
+    def _note_success(self):
+        """请求成功后统计, 连续成功若干次后缓慢放宽节流"""
+        with self._rate_lock:
+            self._since_429_requests += 1
+            self._success_streak += 1
+            if self._success_streak >= RATE_LIMIT_SUCCESS_STREAK:
+                self._min_interval = max(
+                    self._min_interval * RATE_LIMIT_DECREASE_FACTOR,
+                    RATE_LIMIT_MIN_INTERVAL,
+                )
+                self._success_streak = 0
+                logger.info(f'连续成功, 主动节流放宽至 {self._min_interval:.2f}s/请求')
+
+    def _cool_down(self, resp, limited: int, url: str):
+        """
+        429自适应处理:
+        1. 解析Retry-After(缺失则指数退避)得到冷却时长
+        2. 用本轮实际速率反推可持续间隔, 让节流一步到位, 而非盲目翻倍
+        """
+        try:
+            retry_after = float(resp.headers.get('Retry-After', ''))
+        except (TypeError, ValueError):
+            retry_after = 0.0
+        delay = max(
+            retry_after,
+            min(RATE_LIMIT_MIN_COOLDOWN * 2 ** (limited - 1), RATE_LIMIT_MAX_COOLDOWN),
+        )
+        delay = min(delay, RATE_LIMIT_MAX_COOLDOWN)
+        with self._rate_lock:
+            now = time.monotonic()
+            since = max(self._since_429_requests, 1)
+            elapsed = max(now - self._since_429_start, 0.0)
+            # 服务端允许 since 个请求后要冷却 delay 秒 -> 可持续间隔 = (elapsed+delay)/since
+            estimate = (elapsed + delay) / since
+            self._min_interval = min(
+                max(self._min_interval * RATE_LIMIT_INCREASE_FACTOR, estimate),
+                RATE_LIMIT_MAX_INTERVAL,
+            )
+            self._since_429_requests = 0
+            self._since_429_start = now + delay
+            self._success_streak = 0
+            until = now + delay
+            # 已有冷却时, 只在明显延长时才覆盖, 避免并发线程反复堆叠
+            extended = until > self._cooldown_until + 1
+            if extended:
+                self._cooldown_until = until
+                self._cooldown_started = True
+        if extended:
+            logger.warning(
+                f'触发限流(429), 冷却 {delay:.0f}s, 主动节流调至 {self._min_interval:.2f}s/请求: {url}'
+            )
 
     def requester(self, method: str, url: str, **kwargs):
         code = None
-        for i in range(self.max_download_times):
+        attempts = 0
+        limited = 0
+        while True:
+            self._wait_cooldown()
+            self._throttle()
+            code = None
             try:
                 r_headers = (crk := copy.deepcopy(self.request_kwargs)).get('headers', {})
                 k_headers = (ck := copy.deepcopy(kwargs)).pop('headers', {})
                 r_headers.update(k_headers)
                 crk.update(ck)
-                if (resp := self.session.request(method, url, **crk)).ok:
-                    break
+                resp = self.session.request(method, url, **crk)
+                if resp.ok:
+                    self._note_success()
+                    return resp
                 code = resp.status_code
             except requests.exceptions.SSLError:
                 self.request_kwargs['verify'] = False
@@ -89,11 +205,18 @@ class Downloader(object):
                 logger.warning('检测到存在SSL认证，已自动忽略')
                 time.sleep(0.1)
             except (requests.exceptions.RequestException, Exception) as e:
-                logger.error(f'第{i + 1}次请求异常: {e}')
+                logger.error(f'第{attempts + 1}次请求异常: {e}')
                 time.sleep(0.1)
-        else:
-            raise HTTPStatusCodeError(f'{code}')
-        return resp
+            if code == 429:
+                # 429不计入普通重试次数, 冷却后继续请求同一个链接
+                limited += 1
+                if limited > RATE_LIMIT_MAX_RETRIES:
+                    raise HTTPStatusCodeError(f'{code}')
+                self._cool_down(resp, limited, url)
+                continue
+            attempts += 1
+            if attempts >= self.max_download_times:
+                raise HTTPStatusCodeError(f'{code}')
 
     @property
     def is_all_confirmed(self) -> bool:
@@ -131,7 +254,8 @@ class Downloader(object):
                     self.smart_save(segment.init_url, segment.headers, segment.init_path)
                 except DownloadException as e:
                     self.is_stop_all = True
-                    self.error = e.__dict__
+                    if not self.error:
+                        self.error = e.__dict__
                 except Exception as e:
                     self.is_stop_all = True
                     logger.error(f'下载元数据异常: {mt}.{key[0]}, {e}')
@@ -148,7 +272,8 @@ class Downloader(object):
             self.plugin.decrypt(task).rename(task.filepath)
         except DownloadException as e:
             self.is_stop_all = True
-            self.error = e.__dict__
+            if not self.error:
+                self.error = e.__dict__
         except Exception as e:
             self.is_stop_all = True
             logger.error(f'下载任务异常: {e}')
@@ -158,24 +283,29 @@ class Downloader(object):
         if headers:
             rk['headers'] = headers
         self.downloaded_size.pop(path.name, None)
-        if self.chunked_mode:
-            st_time = time.time()
-            with self.requester('get', url, stream=True, **rk) as resp, open(path, 'wb') as f:
-                self.downloaded_size[path.name][1] = int(resp.headers.get('Content-Length', 0))
-                for chunk in resp.iter_content(self.chunk_size):
-                    f.write(chunk)
-                    self.downloaded_size[path.name][0] += len(chunk)
-                    if (
-                            (duration := time.time() - self.start_time) > self.overall_timeout
-                            or (duration := time.time() - st_time) > self.per_timeout
-                    ):
-                        self.downloaded_size.pop(path.name, None)
-                        logger.warning(f'下载已超时：{int(duration)}, 终止程序运行')
-                        raise ReachMaxDownloadLimitError(f'timeout: {int(duration)}')
-        else:
-            resp = self.requester('get', url, **rk)
-            path.write_bytes(resp.content)
-            self.downloaded_size[path.name] = [len(resp.content), len(resp.content)]
+        try:
+            if self.chunked_mode:
+                st_time = time.time()
+                with self.requester('get', url, stream=True, **rk) as resp, open(path, 'wb') as f:
+                    self.downloaded_size[path.name][1] = int(resp.headers.get('Content-Length', 0))
+                    for chunk in resp.iter_content(self.chunk_size):
+                        f.write(chunk)
+                        self.downloaded_size[path.name][0] += len(chunk)
+                        if (
+                                (duration := time.time() - self.start_time) > self.overall_timeout
+                                or (duration := time.time() - st_time) > self.per_timeout
+                        ):
+                            logger.warning(f'下载已超时：{int(duration)}, 终止程序运行')
+                            raise ReachMaxDownloadLimitError(f'timeout: {int(duration)}')
+            else:
+                resp = self.requester('get', url, **rk)
+                path.write_bytes(resp.content)
+                self.downloaded_size[path.name] = [len(resp.content), len(resp.content)]
+        except BaseException:
+            # 限流重试耗尽或中断时, 残留的半截切片必须删除, 之后整片重新下载
+            self.downloaded_size.pop(path.name, None)
+            self.remove(path)
+            raise
 
     def wipe(self):
         if not self.duration_only:
