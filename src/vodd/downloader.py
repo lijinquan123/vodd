@@ -70,6 +70,7 @@ class Downloader(object):
         # 控制参数
         self.chunked_mode = False
         self.is_stop_all = False
+        self.keep = kwargs.get('keep', False)
         self.start_time = time.time()
         self.session = requests.Session()
         self.request_kwargs = get_request_kwargs(**kwargs)
@@ -387,7 +388,11 @@ class Downloader(object):
             self.remove(path)
             raise
 
-    def wipe(self):
+    def wipe(self, force: bool = False):
+        """删除缓存文件夹; -k保留模式下载结束后不删除(下载开始前的清理不受影响)"""
+        if self.keep and not force:
+            logger.info(f'保留缓存文件夹: {self.temp_dir}')
+            return
         if not self.duration_only:
             logger.info(f'删除缓存文件夹: {self.temp_dir}')
             shutil.rmtree(self.temp_dir, ignore_errors=True)
@@ -425,10 +430,10 @@ class Downloader(object):
 
         下载前删除已存在的临时文件夹
         所有任务下载成功后则合并临时文件夹到指定路径
-        删除临时文件夹
+        删除临时文件夹(-k保留模式除外)
         :return:
         """
-        self.wipe()
+        self.wipe(force=True)
         try:
             self.plugin = self.core.get_suitable_plugin()
             logger.info(f'使用插件：{self.plugin.__class__.__name__}')

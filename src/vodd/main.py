@@ -48,6 +48,8 @@ def build_parser():
                             help='分块文件大小')
     downloader.add_argument('--segment-size', type=int, default=0, dest='segment_size',
                             help='下载切片的数量，默认全部下载')
+    downloader.add_argument('-k', action='store_true', dest='keep',
+                            help='保留所有ts切片与合并后的视频文件, 下载结束后不删除缓存目录')
 
     selector = parser.add_argument_group('selector')
     selector.add_argument('--height', type=commalist, dest='height', default='1080,480,1080',
