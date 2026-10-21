@@ -33,15 +33,12 @@ from vodd.utils.request_adapter import get_request_kwargs
 
 logger = logging.getLogger(__name__)
 
-# 429通用处理: 踩雷->恢复->学习限制->收敛到安全频率, 不额外暴露参数
-RATE_LIMIT_INITIAL_INTERVAL = 0.2  # 初始主动节流: 每请求间隔(秒), 即 5 请求/秒
-RATE_LIMIT_MIN_INTERVAL = 0.1  # 节流下限, 最快不超过 10 请求/秒
-RATE_LIMIT_MAX_INTERVAL = 60.0  # 节流上限, 最慢 1 请求/分钟
-RATE_LIMIT_INCREASE_FACTOR = 1.5  # 样本不足时, 429 只做临时小幅上调
-RATE_LIMIT_SAFETY_FACTOR = 1.5  # 学到的限制再留 50% 余量, 确保稳定不触发 429
-RATE_LIMIT_MIN_SAMPLE = 10  # 至少成功多少个请求才信任 estimate
-RATE_LIMIT_DECREASE_FACTOR = 0.9  # 连续成功时每次把间隔缩小10%
-RATE_LIMIT_SUCCESS_STREAK = 5  # 连续成功多少个请求才放宽一次节流
+# 429通用处理: 二分法在[最小间隔, 最大间隔]内逼近"不触发429的最大请求速率", 不额外暴露参数
+RATE_LIMIT_MIN_INTERVAL = 0.05  # 最小请求间隔(秒) = 20 请求/秒, 二分下界
+RATE_LIMIT_MAX_INTERVAL = 60.0  # 最大请求间隔(秒) = 1 请求/分钟, 二分上界
+RATE_LIMIT_START_INTERVAL = 0.2  # 初始请求间隔(秒) = 5 请求/秒, 起步试探点
+RATE_LIMIT_CONVERGE_GAP = 0.1  # 收敛判定: hi - lo < 0.1 秒时停止向上二分
+RATE_LIMIT_SUCCESS_STREAK = 20  # 连续成功多少个请求才向上二分提速
 RATE_LIMIT_MAX_RETRIES = 20  # 单个请求最多经历多少次429
 RATE_LIMIT_MAX_COOLDOWN = 300  # 单次冷却时间上限(秒)
 RATE_LIMIT_MIN_COOLDOWN = 1  # 无Retry-After时的最小退避(秒)
@@ -84,16 +81,15 @@ class Downloader(object):
         self.plugin: BasePlugin | None = None
         self.concat_paths = defaultdict(lambda: [])
         self.downloaded_size = defaultdict(lambda: [0, 0])
-        # 429通用处理: 主动节流 + 自适应冷却, 所有线程共享同一把锁
+        # 429通用处理: 二分法限速 + 自适应冷却, 所有线程共享同一把锁
         self._rate_lock = threading.Lock()
         self._cooldown_until = 0.0
         self._cooldown_started = False
-        self._min_interval = RATE_LIMIT_INITIAL_INTERVAL
-        self._safe_interval = 0.0  # 学到的"不会触发429"的安全间隔, 只增不减
-        self._next_request_time = 0.0
-        self._success_streak = 0
-        self._since_429_requests = 0
-        self._since_429_start = 0.0
+        self._interval = RATE_LIMIT_START_INTERVAL  # 当前请求间隔(秒)
+        self._lo = RATE_LIMIT_MIN_INTERVAL  # 二分下界: 过快会触发429的一侧
+        self._hi = RATE_LIMIT_MAX_INTERVAL  # 二分上界: 安全的一侧
+        self._streak = 0  # 连续成功请求数
+        self._next_request_at = 0.0  # 下一个请求允许发出的时间戳
 
     def _wait_cooldown(self):
         """
@@ -115,7 +111,8 @@ class Downloader(object):
 
     def _throttle(self):
         """
-        主动节流: 所有线程共享一个最小请求间隔, 使整体速率不超过 1/_min_interval
+        节拍器: 保证全局任意两个请求之间至少间隔 _interval 秒
+        所有线程共享同一个时间戳, 整体速率 = 1 / _interval
         """
         while True:
             if self.is_stop_all:
@@ -124,31 +121,26 @@ class Downloader(object):
                 raise ReachMaxDownloadLimitError(f'timeout: {int(duration)}')
             with self._rate_lock:
                 now = time.monotonic()
-                wait = self._next_request_time - now
+                wait = self._next_request_at - now
                 if wait <= 0:
-                    if not self._since_429_start:
-                        self._since_429_start = now
-                    self._next_request_time = now + self._min_interval
+                    self._next_request_at = now + self._interval
                     return
             time.sleep(min(wait, 0.1))
 
     def _note_success(self):
-        """请求成功后统计, 连续成功若干次后向学到的安全间隔放宽"""
+        """请求成功后累计连续成功数, 达标说明当前间隔过于保守, 向上二分提速"""
         with self._rate_lock:
-            self._since_429_requests += 1
-            self._success_streak += 1
-            if self._success_streak >= RATE_LIMIT_SUCCESS_STREAK:
-                # 放宽最多回到学到的安全间隔, 不再无脑降到 MIN_INTERVAL, 避免反复踩雷震荡
-                floor = self._safe_interval or RATE_LIMIT_MIN_INTERVAL
-                self._min_interval = max(self._min_interval * RATE_LIMIT_DECREASE_FACTOR, floor)
-                self._success_streak = 0
-                logger.info(f'连续成功, 主动节流放宽至 {self._min_interval:.2f}s/请求')
+            self._streak += 1
+            if self._streak >= RATE_LIMIT_SUCCESS_STREAK and self._hi - self._lo > RATE_LIMIT_CONVERGE_GAP:
+                self._hi = self._interval
+                self._interval = (self._lo + self._hi) / 2
+                self._streak = 0
 
     def _cool_down(self, resp, limited: int, url: str):
         """
         429自适应处理:
         1. 解析Retry-After(缺失则指数退避)得到冷却时长
-        2. 用本轮实际速率反推可持续间隔, 让节流一步到位, 而非盲目翻倍
+        2. 当前间隔太快触发429, 收紧二分下界并降速, 让限速一步到位
         """
         try:
             retry_after = float(resp.headers.get('Retry-After', ''))
@@ -162,36 +154,19 @@ class Downloader(object):
         with self._rate_lock:
             now = time.monotonic()
             until = now + delay
-            # 一轮冷却只统计一个429: 当前不在冷却期才算新一轮, 才会重算节流
-            # 其余并发线程的429只负责延长冷却, 不再用被清零的 since 重算, 避免 estimate 一步放大到上限
+            # 一轮冷却只降一次速: 当前不在冷却期才算新一轮, 才会二分降速
+            # 其余并发线程的429只负责延长冷却, 避免 interval 被连踩多级放大
             new_round = self._cooldown_until <= now + 1
             if new_round:
-                since = max(self._since_429_requests, 1)
-                elapsed = max(now - self._since_429_start, 0.0)
-                # 服务端允许 since 个请求后要冷却 delay 秒 -> 可持续间隔 = (elapsed+delay)/since
-                estimate = (elapsed + delay) / since
-                if since >= RATE_LIMIT_MIN_SAMPLE:
-                    # 样本可信: 学到"不会触发429"的安全间隔(留余量), 只增不减
-                    self._safe_interval = max(
-                        self._safe_interval,
-                        min(estimate * RATE_LIMIT_SAFETY_FACTOR, RATE_LIMIT_MAX_INTERVAL),
-                    )
-                    self._min_interval = max(self._min_interval, self._safe_interval)
-                else:
-                    # 样本太少不可信: 只做临时小幅上调, 不污染安全间隔
-                    self._min_interval = min(
-                        self._min_interval * RATE_LIMIT_INCREASE_FACTOR,
-                        RATE_LIMIT_MAX_INTERVAL,
-                    )
-                self._since_429_requests = 0
-                self._since_429_start = now + delay
-                self._success_streak = 0
+                self._lo = self._interval
+                self._interval = (self._lo + self._hi) / 2
+                self._streak = 0
             if until > self._cooldown_until:
                 self._cooldown_until = until
                 self._cooldown_started = True
         if new_round:
             logger.warning(
-                f'触发限流(429), 冷却 {delay:.0f}s, 主动节流调至 {self._min_interval:.2f}s/请求: {url}'
+                f'触发限流(429), 冷却 {delay:.0f}s, 请求间隔调至 {self._interval:.3f}s({1 / self._interval:.2f}请求/秒): {url}'
             )
 
     def requester(self, method: str, url: str, **kwargs):
