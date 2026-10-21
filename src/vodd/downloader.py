@@ -14,6 +14,7 @@ import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from hashlib import md5
 from pathlib import Path
 from urllib.parse import urlparse
@@ -33,12 +34,11 @@ from vodd.utils.request_adapter import get_request_kwargs
 
 logger = logging.getLogger(__name__)
 
-# 429通用处理: AIMD(和性增/积性减)在[最小间隔, 最大间隔]内逼近"不触发429的最大请求速率", 不额外暴露参数
-RATE_LIMIT_MIN_INTERVAL = 0.05  # 最小请求间隔(秒) = 20 请求/秒, 和性增下限
-RATE_LIMIT_MAX_INTERVAL = 60.0  # 最大请求间隔(秒) = 1 请求/分钟, 积性减上限
-RATE_LIMIT_START_INTERVAL = 0.2  # 初始请求间隔(秒) = 5 请求/秒, 起步试探点
-RATE_LIMIT_DECREASE_FACTOR = 1.5  # 积性减: 每轮429冷却后请求间隔乘以的系数
-RATE_LIMIT_INCREASE_STEP = 0.01  # 和性增: 每个成功请求将间隔线性减少的秒数
+# 429通用处理: 正常态不限速(视为正常源); 触发429才转入限流态, 不额外暴露参数
+RATE_LIMIT_PROBE_INTERVAL = 5.0  # 探测模式: 每5秒尝试下一个切片, 200后才开启倍速
+RATE_LIMIT_CLEAN_WINDOW = 60.0  # 倍速模式: 连续60秒无429才升档
+RATE_LIMIT_START_MULTIPLIER = 1.0  # 探测成功后的起步倍速(1x = 下载速率与媒体实时时长相等)
+NOMINAL_SEGMENT_DURATION = 5.0  # 切片时长缺失时的名义时长(秒)
 RATE_LIMIT_MAX_RETRIES = 20  # 单个请求最多经历多少次429
 RATE_LIMIT_MAX_COOLDOWN = 300  # 单次冷却时间上限(秒)
 RATE_LIMIT_MIN_COOLDOWN = 1  # 无Retry-After时的最小退避(秒)
@@ -81,35 +81,28 @@ class Downloader(object):
         self.plugin: BasePlugin | None = None
         self.concat_paths = defaultdict(lambda: [])
         self.downloaded_size = defaultdict(lambda: [0, 0])
-        # 429通用处理: AIMD限速 + 自适应冷却, 所有线程共享同一把锁
+        # 429通用处理: 正常不限速 -> 429后单线程探测 -> 倍速阶梯, 所有线程共享同一把锁
         self._rate_lock = threading.Lock()
+        self._serial_gate = threading.Lock()  # 探测模式的单线程串行门
         self._cooldown_until = 0.0
         self._cooldown_started = False
-        self._interval = RATE_LIMIT_START_INTERVAL  # 当前请求间隔(秒)
-        self._next_request_at = 0.0  # 下一个请求允许发出的时间戳
+        self._rate_mode = 'normal'  # normal不限速 / probe单线程探测 / limited倍速节拍
+        self._multiplier = 0.0  # 当前倍速(limited模式有效)
+        self._pending_multiplier = RATE_LIMIT_START_MULTIPLIER  # 探测成功后的起步倍速
+        self._prev_multiplier = None  # 升档前的上一档, 撞墙后回退并锁定
+        self._locked = False  # 锁定后不再调整倍速
+        self._clean_since = 0.0  # 无429干净窗口计时起点
+        self._clock_origin = 0.0  # 播放时钟起点(单调钟)
+        self._media_consumed = 0.0  # 已放行请求的媒体秒数(播放时钟)
+        self._next_request_at = 0.0  # 探测模式: 下一个请求允许发出的时间戳
 
-    def _wait_cooldown(self):
+    def _acquire_slot(self, cost: float = 0.0):
         """
-        冷却等待, 429之后所有线程统一停顿, 期间保持对终止标志和总超时的响应
-        """
-        while True:
-            if self.is_stop_all:
-                raise DownloadTaskError('下载已被终止')
-            if (duration := time.time() - self.start_time) > self.overall_timeout:
-                raise ReachMaxDownloadLimitError(f'timeout: {int(duration)}')
-            with self._rate_lock:
-                remain = self._cooldown_until - time.monotonic()
-                if remain <= 0:
-                    if self._cooldown_started:
-                        self._cooldown_started = False
-                        logger.warning('429冷却结束, 恢复下载')
-                    return
-            time.sleep(min(remain, 1.0))
-
-    def _throttle(self):
-        """
-        节拍器: 保证全局任意两个请求之间至少间隔 _interval 秒
-        所有线程共享同一个时间戳, 整体速率 = 1 / _interval
+        请求准入(所有线程共享同一把锁):
+        - 冷却期: 全体等待, 期间保持对终止标志和总超时的响应
+        - normal: 不限速, 把源当成正常源对待
+        - probe: 每 RATE_LIMIT_PROBE_INTERVAL 秒至多放行一个请求
+        - limited: 播放时钟节拍, 整体速率恒等于 倍速x媒体实时时长, 与线程数无关
         """
         while True:
             if self.is_stop_all:
@@ -118,22 +111,56 @@ class Downloader(object):
                 raise ReachMaxDownloadLimitError(f'timeout: {int(duration)}')
             with self._rate_lock:
                 now = time.monotonic()
-                wait = self._next_request_at - now
-                if wait <= 0:
-                    self._next_request_at = now + self._interval
-                    return
-            time.sleep(min(wait, 0.1))
+                remain = self._cooldown_until - now
+                if remain <= 0:
+                    if self._cooldown_started:
+                        self._cooldown_started = False
+                        logger.warning('429冷却结束, 恢复请求')
+                    if self._rate_mode == 'probe':
+                        remain = self._next_request_at - now
+                        if remain <= 0:
+                            self._next_request_at = now + RATE_LIMIT_PROBE_INTERVAL
+                            return
+                    elif self._rate_mode == 'limited':
+                        budget = (now - self._clock_origin) * self._multiplier
+                        if self._media_consumed <= budget:
+                            self._media_consumed += cost
+                            return
+                        remain = (self._media_consumed - budget) / self._multiplier
+                    else:
+                        return
+            time.sleep(min(max(remain, 0.05), 1.0))
 
-    def _note_success(self):
-        """请求成功后和性增: 间隔线性小幅减少, 平滑回升速率, 降低再次触发429的概率"""
+    def _note_success(self, cost: float = 0.0):
+        """请求成功: 探测模式确认200后开启倍速; 倍速模式未锁定时, 干净窗口满60秒升档"""
         with self._rate_lock:
-            self._interval = max(self._interval - RATE_LIMIT_INCREASE_STEP, RATE_LIMIT_MIN_INTERVAL)
+            now = time.monotonic()
+            if self._rate_mode == 'probe':
+                # 只有探测到200才能开启倍速, 保证统计干净
+                self._rate_mode = 'limited'
+                self._multiplier = self._pending_multiplier
+                self._clock_origin = now
+                self._media_consumed = cost  # 本次探测成功的请求计入播放时钟
+                self._clean_since = now
+                logger.info(
+                    f'探测成功(200), 开启倍速模式: {self._multiplier:g}x'
+                    f'{"(已锁定)" if self._locked else ""}'
+                )
+            elif self._rate_mode == 'limited' and not self._locked:
+                if now - self._clean_since >= RATE_LIMIT_CLEAN_WINDOW:
+                    # 阶梯升档: 首档直接2x, 之后每次+2(1x→2x→4x→6x→8x), 撞墙后回退上一档
+                    self._prev_multiplier = self._multiplier
+                    self._multiplier = 2 if self._multiplier < 2 else self._multiplier + 2
+                    self._clock_origin = now
+                    self._media_consumed = 0.0
+                    self._clean_since = now
+                    logger.info(f'连续{RATE_LIMIT_CLEAN_WINDOW:.0f}秒无429, 倍速升至 {self._multiplier:g}x')
 
     def _cool_down(self, resp, limited: int, url: str):
         """
         429自适应处理:
         1. 解析Retry-After(缺失则指数退避)得到冷却时长
-        2. 当前间隔太快触发429, 积性减直接放大间隔, 让限速一步到位
+        2. 转入单线程探测模式(每5秒尝试下一个切片), 探测到200后按目标倍速开启限速
         """
         try:
             retry_after = float(resp.headers.get('Retry-After', ''))
@@ -145,50 +172,68 @@ class Downloader(object):
         )
         delay = min(delay, RATE_LIMIT_MAX_COOLDOWN)
         with self._rate_lock:
-            now = time.monotonic()
-            until = now + delay
-            # 一轮冷却只降一次速: 当前不在冷却期才算新一轮, 才会积性减降速
-            # 其余并发线程的429只负责延长冷却, 避免 interval 被连踩多级放大
-            new_round = self._cooldown_until <= now + 1
-            if new_round:
-                # 积性减: 一轮冷却只降一次速, 间隔乘系数并夹在上限内
-                self._interval = min(
-                    self._interval * RATE_LIMIT_DECREASE_FACTOR, RATE_LIMIT_MAX_INTERVAL
-                )
+            until = time.monotonic() + delay
             if until > self._cooldown_until:
                 self._cooldown_until = until
                 self._cooldown_started = True
-        if new_round:
-            logger.warning(
-                f'触发限流(429), 冷却 {delay:.0f}s, 请求间隔调至 {self._interval:.3f}s({1 / self._interval:.2f}请求/秒): {url}'
-            )
+            if self._rate_mode == 'normal':
+                # 正常源首次撞429: 成为429源, 探测成功后从1x起步
+                self._pending_multiplier = RATE_LIMIT_START_MULTIPLIER
+                self._prev_multiplier = None
+                self._locked = False
+                action = (f'转入单线程探测(每{RATE_LIMIT_PROBE_INTERVAL:.0f}s), '
+                          f'探测成功后按 {self._pending_multiplier:g}x 起步')
+            elif self._rate_mode == 'limited':
+                if self._locked:
+                    # 锁定期撞墙: 倍速不再调整, 冷却后维持当前档
+                    self._pending_multiplier = self._multiplier
+                    action = f'倍速维持 {self._multiplier:g}x(已锁定)'
+                elif self._prev_multiplier is not None:
+                    # 攀升期撞墙: 退回上一档并锁定
+                    self._pending_multiplier = self._prev_multiplier
+                    self._locked = True
+                    action = f'倍速由 {self._multiplier:g}x 退回 {self._pending_multiplier:g}x 并锁定'
+                else:
+                    # 1x起步就撞墙: 维持1x, 不锁定(给偶发429留恢复空间)
+                    self._pending_multiplier = self._multiplier
+                    action = '倍速维持 1x, 继续观察'
+            else:
+                # 探测期仍在429: 只延长冷却
+                action = '继续单线程探测'
+            self._rate_mode = 'probe'
+        logger.warning(f'触发限流(429), 冷却 {delay:.0f}s, {action}: {url}')
 
-    def requester(self, method: str, url: str, **kwargs):
+    def requester(self, method: str, url: str, cost: float = 0.0, **kwargs):
+        """
+        统一请求入口
+        :param cost: 该请求对应的媒体时长(秒), 倍速节拍用; 非媒体请求(清单/key/HEAD)传0
+        """
         code = None
         attempts = 0
         limited = 0
         while True:
-            self._wait_cooldown()
-            self._throttle()
-            code = None
-            try:
-                r_headers = (crk := copy.deepcopy(self.request_kwargs)).get('headers', {})
-                k_headers = (ck := copy.deepcopy(kwargs)).pop('headers', {})
-                r_headers.update(k_headers)
-                crk.update(ck)
-                resp = self.session.request(method, url, **crk)
-                if resp.ok:
-                    self._note_success()
-                    return resp
-                code = resp.status_code
-            except requests.exceptions.SSLError:
-                self.request_kwargs['verify'] = False
-                urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-                logger.warning('检测到存在SSL认证，已自动忽略')
-                time.sleep(0.1)
-            except (requests.exceptions.RequestException, Exception) as e:
-                logger.error(f'第{attempts + 1}次请求异常: {e}')
-                time.sleep(0.1)
+            # 探测模式持全局串行门, 保证429源探测期间真正的单线程
+            with (self._serial_gate if self._rate_mode == 'probe' else nullcontext()):
+                self._acquire_slot(cost)
+                code = None
+                try:
+                    r_headers = (crk := copy.deepcopy(self.request_kwargs)).get('headers', {})
+                    k_headers = (ck := copy.deepcopy(kwargs)).pop('headers', {})
+                    r_headers.update(k_headers)
+                    crk.update(ck)
+                    resp = self.session.request(method, url, **crk)
+                    if resp.ok:
+                        self._note_success(cost)
+                        return resp
+                    code = resp.status_code
+                except requests.exceptions.SSLError:
+                    self.request_kwargs['verify'] = False
+                    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+                    logger.warning('检测到存在SSL认证，已自动忽略')
+                    time.sleep(0.1)
+                except (requests.exceptions.RequestException, Exception) as e:
+                    logger.error(f'第{attempts + 1}次请求异常: {e}')
+                    time.sleep(0.1)
             if code == 429:
                 # 429不计入普通重试次数, 冷却后继续请求同一个链接
                 limited += 1
@@ -249,7 +294,10 @@ class Downloader(object):
             if (duration := time.time() - self.start_time) > self.overall_timeout:
                 logger.warning(f'下载已超时：{int(duration)}, 终止程序运行')
                 raise ReachMaxDownloadLimitError(f'timeout: {int(duration)}')
-            self.smart_save(task.url, task.headers, task.filepath)
+            self.smart_save(
+                task.url, task.headers, task.filepath,
+                cost=task.duration or NOMINAL_SEGMENT_DURATION,
+            )
             task.confirmed = True
             self.plugin.decrypt(task).rename(task.filepath)
         except DownloadException as e:
@@ -260,7 +308,7 @@ class Downloader(object):
             self.is_stop_all = True
             logger.error(f'下载任务异常: {e}')
 
-    def smart_save(self, url: str, headers: dict, path: Path, ):
+    def smart_save(self, url: str, headers: dict, path: Path, cost: float = 0.0):
         rk = {}
         if headers:
             rk['headers'] = headers
@@ -268,7 +316,7 @@ class Downloader(object):
         try:
             if self.chunked_mode:
                 st_time = time.time()
-                with self.requester('get', url, stream=True, **rk) as resp, open(path, 'wb') as f:
+                with self.requester('get', url, cost=cost, stream=True, **rk) as resp, open(path, 'wb') as f:
                     self.downloaded_size[path.name][1] = int(resp.headers.get('Content-Length', 0))
                     for chunk in resp.iter_content(self.chunk_size):
                         f.write(chunk)
@@ -280,7 +328,7 @@ class Downloader(object):
                             logger.warning(f'下载已超时：{int(duration)}, 终止程序运行')
                             raise ReachMaxDownloadLimitError(f'timeout: {int(duration)}')
             else:
-                resp = self.requester('get', url, **rk)
+                resp = self.requester('get', url, cost=cost, **rk)
                 path.write_bytes(resp.content)
                 self.downloaded_size[path.name] = [len(resp.content), len(resp.content)]
         except BaseException:
@@ -444,7 +492,8 @@ class DownloadCore(object):
         else:
             url = segment.url
             filepath = segment.filepath
-        self.downloader.smart_save(url, segment.headers, filepath)
+        cost = 0.0 if segment.init_url else (segment.duration or NOMINAL_SEGMENT_DURATION)
+        self.downloader.smart_save(url, segment.headers, filepath, cost=cost)
         if not segment.init_url:
             self.downloader.plugin.decrypt(segment).rename(segment.filepath)
         try:
