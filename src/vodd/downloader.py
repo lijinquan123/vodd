@@ -33,11 +33,13 @@ from vodd.utils.request_adapter import get_request_kwargs
 
 logger = logging.getLogger(__name__)
 
-# 429通用处理: 主动节流 + 自适应冷却, 不额外暴露参数
+# 429通用处理: 踩雷->恢复->学习限制->收敛到安全频率, 不额外暴露参数
 RATE_LIMIT_INITIAL_INTERVAL = 0.2  # 初始主动节流: 每请求间隔(秒), 即 5 请求/秒
 RATE_LIMIT_MIN_INTERVAL = 0.1  # 节流下限, 最快不超过 10 请求/秒
 RATE_LIMIT_MAX_INTERVAL = 60.0  # 节流上限, 最慢 1 请求/分钟
-RATE_LIMIT_INCREASE_FACTOR = 1.5  # 触发429时至少把间隔放大1.5倍
+RATE_LIMIT_INCREASE_FACTOR = 1.5  # 样本不足时, 429 只做临时小幅上调
+RATE_LIMIT_SAFETY_FACTOR = 1.5  # 学到的限制再留 50% 余量, 确保稳定不触发 429
+RATE_LIMIT_MIN_SAMPLE = 10  # 至少成功多少个请求才信任 estimate
 RATE_LIMIT_DECREASE_FACTOR = 0.9  # 连续成功时每次把间隔缩小10%
 RATE_LIMIT_SUCCESS_STREAK = 5  # 连续成功多少个请求才放宽一次节流
 RATE_LIMIT_MAX_RETRIES = 20  # 单个请求最多经历多少次429
@@ -87,6 +89,7 @@ class Downloader(object):
         self._cooldown_until = 0.0
         self._cooldown_started = False
         self._min_interval = RATE_LIMIT_INITIAL_INTERVAL
+        self._safe_interval = 0.0  # 学到的"不会触发429"的安全间隔, 只增不减
         self._next_request_time = 0.0
         self._success_streak = 0
         self._since_429_requests = 0
@@ -130,15 +133,14 @@ class Downloader(object):
             time.sleep(min(wait, 0.1))
 
     def _note_success(self):
-        """请求成功后统计, 连续成功若干次后缓慢放宽节流"""
+        """请求成功后统计, 连续成功若干次后向学到的安全间隔放宽"""
         with self._rate_lock:
             self._since_429_requests += 1
             self._success_streak += 1
             if self._success_streak >= RATE_LIMIT_SUCCESS_STREAK:
-                self._min_interval = max(
-                    self._min_interval * RATE_LIMIT_DECREASE_FACTOR,
-                    RATE_LIMIT_MIN_INTERVAL,
-                )
+                # 放宽最多回到学到的安全间隔, 不再无脑降到 MIN_INTERVAL, 避免反复踩雷震荡
+                floor = self._safe_interval or RATE_LIMIT_MIN_INTERVAL
+                self._min_interval = max(self._min_interval * RATE_LIMIT_DECREASE_FACTOR, floor)
                 self._success_streak = 0
                 logger.info(f'连续成功, 主动节流放宽至 {self._min_interval:.2f}s/请求')
 
@@ -168,10 +170,19 @@ class Downloader(object):
                 elapsed = max(now - self._since_429_start, 0.0)
                 # 服务端允许 since 个请求后要冷却 delay 秒 -> 可持续间隔 = (elapsed+delay)/since
                 estimate = (elapsed + delay) / since
-                self._min_interval = min(
-                    max(self._min_interval * RATE_LIMIT_INCREASE_FACTOR, estimate),
-                    RATE_LIMIT_MAX_INTERVAL,
-                )
+                if since >= RATE_LIMIT_MIN_SAMPLE:
+                    # 样本可信: 学到"不会触发429"的安全间隔(留余量), 只增不减
+                    self._safe_interval = max(
+                        self._safe_interval,
+                        min(estimate * RATE_LIMIT_SAFETY_FACTOR, RATE_LIMIT_MAX_INTERVAL),
+                    )
+                    self._min_interval = max(self._min_interval, self._safe_interval)
+                else:
+                    # 样本太少不可信: 只做临时小幅上调, 不污染安全间隔
+                    self._min_interval = min(
+                        self._min_interval * RATE_LIMIT_INCREASE_FACTOR,
+                        RATE_LIMIT_MAX_INTERVAL,
+                    )
                 self._since_429_requests = 0
                 self._since_429_start = now + delay
                 self._success_streak = 0
