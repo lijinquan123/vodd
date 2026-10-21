@@ -125,11 +125,11 @@ class HLS(BasePlugin):
                     with self._lock:
                         if url not in self.keys:
                             resp = self.downloader.requester('GET', url)
-                            if key := resp.content:
+                            if (key := resp.content) and len(key) <= 64:
                                 self.keys[url] = key
                                 logger.warning(f'添加加密key: {url=}, {key=}')
                             else:
-                                raise NotFoundError(f'获取key失败: {key=}')
+                                raise NotFoundError(f'获取key失败或内容异常: {url=}, {len(resp.content)}字节')
                 if url in self.keys:
                     key = self.keys[url]
             elif 'key' in segment.cipher.params:

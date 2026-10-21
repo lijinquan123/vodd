@@ -181,9 +181,9 @@ class Downloader(object):
                         self._clean_since = now
                         logger.info(f'连续{RATE_LIMIT_CLEAN_WINDOW:.0f}秒无429, 倍速升至 {self._multiplier:g}x')
 
-    def _cool_down(self, resp, limited: int, url: str):
+    def _cool_down(self, resp, limited: int, url: str, junk: bool = False):
         """
-        429自适应处理:
+        限流自适应处理(429与200假内容共用):
         1. 解析Retry-After(缺失则指数退避)得到冷却时长
         2. 转入单线程探测模式(每5秒尝试下一个切片), 探测到200后按目标倍速开启限速
         """
@@ -252,12 +252,27 @@ class Downloader(object):
                 # 探测期仍在429: 只延长冷却
                 action = '继续单线程探测'
             self._rate_mode = 'probe'
-        logger.warning(f'触发限流(429), 冷却 {delay:.0f}s, {action}: {url}')
+        logger.warning(f'{"内容拦截(200非媒体)" if junk else "触发限流(429)"}, 冷却 {delay:.0f}s, {action}: {url}')
 
-    def requester(self, method: str, url: str, cost: float = 0.0, **kwargs):
+    def _junk_content(self, resp, stream: bool) -> bool:
+        """
+        媒体内容校验: 拦截"200但内容非媒体"的响应(反爬挑战页/错误页等)
+        此类内容为文本且以<或{开头, 真实媒体流不会; 空响应同样视为异常
+        流式响应只预读首个分块并暂存到resp上, 剩余由调用方继续消费
+        """
+        if stream:
+            peek = next(resp.iter_content(self.chunk_size), b'')
+            resp._vodd_first_chunk = peek
+            head = peek[:1]
+        else:
+            head = resp.content[:1]
+        return not head or head in (b'<', b'{')
+
+    def requester(self, method: str, url: str, cost: float = 0.0, media: bool = False, **kwargs):
         """
         统一请求入口
         :param cost: 该请求对应的媒体时长(秒), 倍速节拍用; 非媒体请求(清单/key/HEAD)传0
+        :param media: 预期响应为二进制媒体(切片/初始化段), 开启内容校验拦截200假响应
         """
         code = None
         attempts = 0
@@ -267,6 +282,7 @@ class Downloader(object):
             with (self._serial_gate if self._rate_mode == 'probe' else nullcontext()):
                 self._acquire_slot(cost)
                 code = None
+                junk = False
                 try:
                     r_headers = (crk := copy.deepcopy(self.request_kwargs)).get('headers', {})
                     k_headers = (ck := copy.deepcopy(kwargs)).pop('headers', {})
@@ -274,9 +290,16 @@ class Downloader(object):
                     crk.update(ck)
                     resp = self.session.request(method, url, **crk)
                     if resp.ok:
-                        self._note_success(cost)
-                        return resp
-                    code = resp.status_code
+                        if media and self._junk_content(resp, stream=kwargs.get('stream')):
+                            # 200但内容非媒体(反爬挑战页等): 与429同类的限流信号, 冷却后重试同一链接
+                            junk = True
+                            resp.close()
+                            code = 429
+                        else:
+                            self._note_success(cost)
+                            return resp
+                    else:
+                        code = resp.status_code
                 except requests.exceptions.SSLError:
                     self.request_kwargs['verify'] = False
                     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -286,11 +309,11 @@ class Downloader(object):
                     logger.error(f'第{attempts + 1}次请求异常: {e}')
                     time.sleep(0.1)
             if code == 429:
-                # 429不计入普通重试次数, 冷却后继续请求同一个链接
+                # 429与内容拦截不计入普通重试次数, 冷却后继续请求同一个链接
                 limited += 1
                 if limited > RATE_LIMIT_MAX_RETRIES:
-                    raise HTTPStatusCodeError(f'{code}')
-                self._cool_down(resp, limited, url)
+                    raise HTTPStatusCodeError('200junk' if junk else f'{code}')
+                self._cool_down(resp, limited, url, junk=junk)
                 continue
             attempts += 1
             if attempts >= self.max_download_times:
@@ -367,8 +390,12 @@ class Downloader(object):
         try:
             if self.chunked_mode:
                 st_time = time.time()
-                with self.requester('get', url, cost=cost, stream=True, **rk) as resp, open(path, 'wb') as f:
+                with self.requester('get', url, cost=cost, media=True, stream=True, **rk) as resp, open(path, 'wb') as f:
                     self.downloaded_size[path.name][1] = int(resp.headers.get('Content-Length', 0))
+                    if (first := getattr(resp, '_vodd_first_chunk', b'')):
+                        # 内容校验时预读的首块, 先落盘再继续流式读取
+                        f.write(first)
+                        self.downloaded_size[path.name][0] += len(first)
                     for chunk in resp.iter_content(self.chunk_size):
                         f.write(chunk)
                         self.downloaded_size[path.name][0] += len(chunk)
@@ -379,7 +406,7 @@ class Downloader(object):
                             logger.warning(f'下载已超时：{int(duration)}, 终止程序运行')
                             raise ReachMaxDownloadLimitError(f'timeout: {int(duration)}')
             else:
-                resp = self.requester('get', url, cost=cost, **rk)
+                resp = self.requester('get', url, cost=cost, media=True, **rk)
                 path.write_bytes(resp.content)
                 self.downloaded_size[path.name] = [len(resp.content), len(resp.content)]
         except BaseException:
@@ -464,6 +491,11 @@ class Downloader(object):
             if self.save_path.exists():
                 self.core.check_video(self.save_path, full=True)
                 check_dts(self.save_path)
+                if (expected := sum(
+                        seg.duration or 0 for seg in self.tasks if seg.type == MediaName.video
+                )) > 0:
+                    # 终检兜底: 实际时长远小于清单时长 => 文件损坏, 拒绝静默产出
+                    self.core.check_duration(self.save_path, expected)
         except DownloadException as e:
             logger.error(f'下载异常: {e}')
             if not self.error:
@@ -539,6 +571,19 @@ class DownloadCore(object):
             video['v_framerate'] = convert_to_num(stream_info['r_frame_rate']) or 0
             video['v_bandwidth'] = convert_to_num(meta['format']['bit_rate'])
         check_video(**video, **self.downloader.kwargs)
+
+    def check_duration(self, filepath: Path, expected: float):
+        """终检兜底: 合并后实际时长与清单时长比对, 拦截静默损坏的文件"""
+        command = f'ffprobe -v error -show_entries format=duration -of json "{filepath.as_posix()}"'
+        try:
+            meta = json.loads(os.popen(command).read().strip())
+            actual = float(meta['format']['duration'])
+        except (KeyError, ValueError):
+            logger.warning('终检无法探测时长, 跳过时长校验')
+            return
+        if actual < expected * 0.9:
+            raise CheckVideoError(f'时长校验失败: 实际{actual:.0f}s 远小于清单{expected:.0f}s, 文件疑似损坏')
+        logger.info(f'时长校验通过: 实际{actual:.0f}s / 清单{expected:.0f}s')
 
     def pre_download(self, segment: Segment) -> Path:
         if segment.init_url:
