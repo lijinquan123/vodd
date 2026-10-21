@@ -33,12 +33,12 @@ from vodd.utils.request_adapter import get_request_kwargs
 
 logger = logging.getLogger(__name__)
 
-# 429通用处理: 二分法在[最小间隔, 最大间隔]内逼近"不触发429的最大请求速率", 不额外暴露参数
-RATE_LIMIT_MIN_INTERVAL = 0.05  # 最小请求间隔(秒) = 20 请求/秒, 二分下界
-RATE_LIMIT_MAX_INTERVAL = 60.0  # 最大请求间隔(秒) = 1 请求/分钟, 二分上界
+# 429通用处理: AIMD(和性增/积性减)在[最小间隔, 最大间隔]内逼近"不触发429的最大请求速率", 不额外暴露参数
+RATE_LIMIT_MIN_INTERVAL = 0.05  # 最小请求间隔(秒) = 20 请求/秒, 和性增下限
+RATE_LIMIT_MAX_INTERVAL = 60.0  # 最大请求间隔(秒) = 1 请求/分钟, 积性减上限
 RATE_LIMIT_START_INTERVAL = 0.2  # 初始请求间隔(秒) = 5 请求/秒, 起步试探点
-RATE_LIMIT_CONVERGE_GAP = 0.1  # 收敛判定: hi - lo < 0.1 秒时停止向上二分
-RATE_LIMIT_SUCCESS_STREAK = 20  # 连续成功多少个请求才向上二分提速
+RATE_LIMIT_DECREASE_FACTOR = 1.5  # 积性减: 每轮429冷却后请求间隔乘以的系数
+RATE_LIMIT_INCREASE_STEP = 0.01  # 和性增: 每个成功请求将间隔线性减少的秒数
 RATE_LIMIT_MAX_RETRIES = 20  # 单个请求最多经历多少次429
 RATE_LIMIT_MAX_COOLDOWN = 300  # 单次冷却时间上限(秒)
 RATE_LIMIT_MIN_COOLDOWN = 1  # 无Retry-After时的最小退避(秒)
@@ -81,14 +81,11 @@ class Downloader(object):
         self.plugin: BasePlugin | None = None
         self.concat_paths = defaultdict(lambda: [])
         self.downloaded_size = defaultdict(lambda: [0, 0])
-        # 429通用处理: 二分法限速 + 自适应冷却, 所有线程共享同一把锁
+        # 429通用处理: AIMD限速 + 自适应冷却, 所有线程共享同一把锁
         self._rate_lock = threading.Lock()
         self._cooldown_until = 0.0
         self._cooldown_started = False
         self._interval = RATE_LIMIT_START_INTERVAL  # 当前请求间隔(秒)
-        self._lo = RATE_LIMIT_MIN_INTERVAL  # 二分下界: 过快会触发429的一侧
-        self._hi = RATE_LIMIT_MAX_INTERVAL  # 二分上界: 安全的一侧
-        self._streak = 0  # 连续成功请求数
         self._next_request_at = 0.0  # 下一个请求允许发出的时间戳
 
     def _wait_cooldown(self):
@@ -128,19 +125,15 @@ class Downloader(object):
             time.sleep(min(wait, 0.1))
 
     def _note_success(self):
-        """请求成功后累计连续成功数, 达标说明当前间隔过于保守, 向上二分提速"""
+        """请求成功后和性增: 间隔线性小幅减少, 平滑回升速率, 降低再次触发429的概率"""
         with self._rate_lock:
-            self._streak += 1
-            if self._streak >= RATE_LIMIT_SUCCESS_STREAK and self._hi - self._lo > RATE_LIMIT_CONVERGE_GAP:
-                self._hi = self._interval
-                self._interval = (self._lo + self._hi) / 2
-                self._streak = 0
+            self._interval = max(self._interval - RATE_LIMIT_INCREASE_STEP, RATE_LIMIT_MIN_INTERVAL)
 
     def _cool_down(self, resp, limited: int, url: str):
         """
         429自适应处理:
         1. 解析Retry-After(缺失则指数退避)得到冷却时长
-        2. 当前间隔太快触发429, 收紧二分下界并降速, 让限速一步到位
+        2. 当前间隔太快触发429, 积性减直接放大间隔, 让限速一步到位
         """
         try:
             retry_after = float(resp.headers.get('Retry-After', ''))
@@ -154,13 +147,14 @@ class Downloader(object):
         with self._rate_lock:
             now = time.monotonic()
             until = now + delay
-            # 一轮冷却只降一次速: 当前不在冷却期才算新一轮, 才会二分降速
+            # 一轮冷却只降一次速: 当前不在冷却期才算新一轮, 才会积性减降速
             # 其余并发线程的429只负责延长冷却, 避免 interval 被连踩多级放大
             new_round = self._cooldown_until <= now + 1
             if new_round:
-                self._lo = self._interval
-                self._interval = (self._lo + self._hi) / 2
-                self._streak = 0
+                # 积性减: 一轮冷却只降一次速, 间隔乘系数并夹在上限内
+                self._interval = min(
+                    self._interval * RATE_LIMIT_DECREASE_FACTOR, RATE_LIMIT_MAX_INTERVAL
+                )
             if until > self._cooldown_until:
                 self._cooldown_until = until
                 self._cooldown_started = True
