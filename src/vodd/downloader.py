@@ -87,6 +87,7 @@ class Downloader(object):
         self._serial_gate = threading.Lock()  # 探测模式的单线程串行门
         self._cooldown_until = 0.0
         self._cooldown_started = False
+        self._cooldown_reason = '429'  # 本次冷却的触发原因: 429 / 风控拦截(200假内容)
         self._rate_mode = 'normal'  # normal不限速 / probe单线程探测 / limited倍速节拍
         self._multiplier = 0.0  # 当前倍速(limited模式有效)
         self._pending_multiplier = RATE_LIMIT_START_MULTIPLIER  # 探测成功后的起步倍速
@@ -120,7 +121,7 @@ class Downloader(object):
                 if remain <= 0:
                     if self._cooldown_started:
                         self._cooldown_started = False
-                        logger.warning('429冷却结束, 恢复请求')
+                        logger.warning(f'{self._cooldown_reason}冷却结束, 恢复请求')
                     if self._rate_mode == 'probe':
                         remain = self._next_request_at - now
                         if remain <= 0:
@@ -152,7 +153,7 @@ class Downloader(object):
                 self._clean_since = now
                 tag = ('(已锁定)' if self._locked else '(强行排空)' if self._draining
                        else '(半档试用)' if self._probation else '')
-                logger.info(f'探测成功(200), 开启倍速模式: {self._multiplier:g}x{tag}')
+                logger.info(f'探测成功(真实内容), 开启倍速模式: {self._multiplier:g}x{tag}')
             if self._rate_mode == 'limited':
                 if self._draining:
                     if now >= self._drain_until:
@@ -252,6 +253,7 @@ class Downloader(object):
                 # 探测期仍在429: 只延长冷却
                 action = '继续单线程探测'
             self._rate_mode = 'probe'
+            self._cooldown_reason = '风控拦截(200假内容)' if junk else '429'
         logger.warning(f'{"内容拦截(200非媒体)" if junk else "触发限流(429)"}, 冷却 {delay:.0f}s, {action}: {url}')
 
     def _junk_content(self, resp, stream: bool) -> bool:
