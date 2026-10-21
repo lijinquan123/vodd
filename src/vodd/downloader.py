@@ -89,7 +89,11 @@ class Downloader(object):
         self._rate_mode = 'normal'  # normal不限速 / probe单线程探测 / limited倍速节拍
         self._multiplier = 0.0  # 当前倍速(limited模式有效)
         self._pending_multiplier = RATE_LIMIT_START_MULTIPLIER  # 探测成功后的起步倍速
-        self._probation = False  # 半档试用态: 攀升撞墙先退半档试用, 期满无429锁定, 再撞退回确认档
+        self._probation = False  # 半档试用态: 攀升撞墙先退半档试用, 期满无429锁定
+        self._probation_retest = False  # 排空后的半档复测: 再撞429则锁定上一个确认档
+        self._draining = False  # 强行排空态: 在上一个确认档硬扛60秒, 消化高速突发挤占的配额窗口
+        self._drain_until = 0.0  # 排空截止时间(单调钟)
+        self._drain_next = 0.0  # 排空期满后复测的半档倍速
         self._locked = False  # 锁定后不再调整倍速
         self._clean_since = 0.0  # 无429干净窗口计时起点
         self._clock_origin = 0.0  # 播放时钟起点(单调钟)
@@ -134,7 +138,7 @@ class Downloader(object):
     def _note_success(self, cost: float = 0.0):
         """
         请求成功: 探测模式确认200后开启倍速;
-        半档试用期满60秒无429则锁定当前档; 未锁定且非试用时, 干净窗口满60秒升档
+        强行排空期满则复测半档; 半档试用期满60秒无429则锁定; 未锁定且非试用/排空时升档
         """
         with self._rate_lock:
             now = time.monotonic()
@@ -145,24 +149,36 @@ class Downloader(object):
                 self._clock_origin = now
                 self._media_consumed = cost  # 本次探测成功的请求计入播放时钟
                 self._clean_since = now
-                logger.info(
-                    f'探测成功(200), 开启倍速模式: {self._multiplier:g}x'
-                    f'{"(已锁定)" if self._locked else "(半档试用)" if self._probation else ""}'
-                )
-            elif self._rate_mode == 'limited' and self._probation:
-                if now - self._clean_since >= RATE_LIMIT_CLEAN_WINDOW:
-                    # 半档试用期满无429: 锁定当前半档
-                    self._probation = False
-                    self._locked = True
-                    logger.info(f'试用{RATE_LIMIT_CLEAN_WINDOW:.0f}秒无429, 倍速锁定 {self._multiplier:g}x')
-            elif self._rate_mode == 'limited' and not self._locked:
-                if now - self._clean_since >= RATE_LIMIT_CLEAN_WINDOW:
-                    # 阶梯升档: 首档直接2x, 之后每次+2(1x→2x→4x→6x→8x)
-                    self._multiplier = 2 if self._multiplier < 2 else self._multiplier + 2
-                    self._clock_origin = now
-                    self._media_consumed = 0.0
-                    self._clean_since = now
-                    logger.info(f'连续{RATE_LIMIT_CLEAN_WINDOW:.0f}秒无429, 倍速升至 {self._multiplier:g}x')
+                tag = ('(已锁定)' if self._locked else '(强行排空)' if self._draining
+                       else '(半档试用)' if self._probation else '')
+                logger.info(f'探测成功(200), 开启倍速模式: {self._multiplier:g}x{tag}')
+            if self._rate_mode == 'limited':
+                if self._draining:
+                    if now >= self._drain_until:
+                        # 排空期满: 复测半档
+                        self._draining = False
+                        self._multiplier = self._drain_next
+                        self._probation = True
+                        self._probation_retest = True
+                        self._clock_origin = now
+                        self._media_consumed = 0.0
+                        self._clean_since = now
+                        logger.info(f'排空期满, 复测半档 {self._multiplier:g}x')
+                elif self._probation:
+                    if now - self._clean_since >= RATE_LIMIT_CLEAN_WINDOW:
+                        # 半档试用期满无429: 锁定当前半档
+                        self._probation = False
+                        self._probation_retest = False
+                        self._locked = True
+                        logger.info(f'试用{RATE_LIMIT_CLEAN_WINDOW:.0f}秒无429, 倍速锁定 {self._multiplier:g}x')
+                elif not self._locked:
+                    if now - self._clean_since >= RATE_LIMIT_CLEAN_WINDOW:
+                        # 阶梯升档: 首档直接2x, 之后每次+2(1x→2x→4x→6x→8x)
+                        self._multiplier = 2 if self._multiplier < 2 else self._multiplier + 2
+                        self._clock_origin = now
+                        self._media_consumed = 0.0
+                        self._clean_since = now
+                        logger.info(f'连续{RATE_LIMIT_CLEAN_WINDOW:.0f}秒无429, 倍速升至 {self._multiplier:g}x')
 
     def _cool_down(self, resp, limited: int, url: str):
         """
@@ -188,6 +204,8 @@ class Downloader(object):
                 # 正常源首次撞429: 成为429源, 探测成功后从1x起步
                 self._pending_multiplier = RATE_LIMIT_START_MULTIPLIER
                 self._probation = False
+                self._probation_retest = False
+                self._draining = False
                 self._locked = False
                 action = (f'转入单线程探测(每{RATE_LIMIT_PROBE_INTERVAL:.0f}s), '
                           f'探测成功后按 {self._pending_multiplier:g}x 起步')
@@ -196,19 +214,35 @@ class Downloader(object):
                     # 锁定期撞墙: 倍速不再调整, 冷却后维持当前档
                     self._pending_multiplier = self._multiplier
                     action = f'倍速维持 {self._multiplier:g}x(已锁定)'
+                elif self._draining:
+                    # 排空期撞墙属预期(消化高速突发挤占的配额窗口), 只冷却不改倍速
+                    self._pending_multiplier = self._multiplier
+                    action = f'倍速维持 {self._multiplier:g}x(强行排空中)'
                 elif self._probation:
-                    # 半档试用仍撞墙: 锁定到再退一档(上一个确认档)
-                    self._probation = False
-                    self._locked = True
-                    self._pending_multiplier = max(self._multiplier - 1, RATE_LIMIT_START_MULTIPLIER)
-                    action = f'倍速由 {self._multiplier:g}x 退回 {self._pending_multiplier:g}x 并锁定'
+                    if self._probation_retest:
+                        # 排空后的复测仍撞墙: 半档确实过快, 锁定上一个确认档
+                        self._probation = False
+                        self._probation_retest = False
+                        self._locked = True
+                        self._pending_multiplier = max(self._multiplier - 1, RATE_LIMIT_START_MULTIPLIER)
+                        action = f'倍速由 {self._multiplier:g}x 退回 {self._pending_multiplier:g}x 并锁定'
+                    else:
+                        # 首次试用撞墙: 多为高速突发挤占配额窗口的残留,
+                        # 退回上一个确认档强行排空60秒消化完, 再复测半档
+                        base = max(self._multiplier - 1, RATE_LIMIT_START_MULTIPLIER)
+                        self._probation = False
+                        self._pending_multiplier = base
+                        self._draining = True
+                        self._drain_until = time.monotonic() + RATE_LIMIT_CLEAN_WINDOW
+                        self._drain_next = self._multiplier
+                        action = (f'倍速由 {self._multiplier:g}x 退回 {base:g}x 强行排空'
+                                  f'{RATE_LIMIT_CLEAN_WINDOW:.0f}秒, 之后复测 {self._drain_next:g}x')
                 elif self._multiplier > 1:
-                    # 攀升撞墙: 先退半档试用, 试用期内再撞429则退回上一个确认档锁定
+                    # 攀升撞墙: 先退半档试用
                     self._pending_multiplier = self._multiplier - 1
                     self._probation = True
-                    next_fallback = max(self._pending_multiplier - 1, RATE_LIMIT_START_MULTIPLIER)
                     action = (f'倍速由 {self._multiplier:g}x 退回 {self._pending_multiplier:g}x 试用, '
-                              f'再撞429则锁定 {next_fallback:g}x')
+                              f'再撞429则排空后复测')
                 else:
                     # 1x起步就撞墙: 维持1x, 不锁定(给偶发429留恢复空间)
                     self._pending_multiplier = self._multiplier
