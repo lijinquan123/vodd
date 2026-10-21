@@ -89,7 +89,7 @@ class Downloader(object):
         self._rate_mode = 'normal'  # normal不限速 / probe单线程探测 / limited倍速节拍
         self._multiplier = 0.0  # 当前倍速(limited模式有效)
         self._pending_multiplier = RATE_LIMIT_START_MULTIPLIER  # 探测成功后的起步倍速
-        self._prev_multiplier = None  # 升档前的上一档, 撞墙后回退并锁定
+        self._probation = False  # 半档试用态: 攀升撞墙先退半档试用, 期满无429锁定, 再撞退回确认档
         self._locked = False  # 锁定后不再调整倍速
         self._clean_since = 0.0  # 无429干净窗口计时起点
         self._clock_origin = 0.0  # 播放时钟起点(单调钟)
@@ -132,7 +132,10 @@ class Downloader(object):
             time.sleep(min(max(remain, 0.05), 1.0))
 
     def _note_success(self, cost: float = 0.0):
-        """请求成功: 探测模式确认200后开启倍速; 倍速模式未锁定时, 干净窗口满60秒升档"""
+        """
+        请求成功: 探测模式确认200后开启倍速;
+        半档试用期满60秒无429则锁定当前档; 未锁定且非试用时, 干净窗口满60秒升档
+        """
         with self._rate_lock:
             now = time.monotonic()
             if self._rate_mode == 'probe':
@@ -144,12 +147,17 @@ class Downloader(object):
                 self._clean_since = now
                 logger.info(
                     f'探测成功(200), 开启倍速模式: {self._multiplier:g}x'
-                    f'{"(已锁定)" if self._locked else ""}'
+                    f'{"(已锁定)" if self._locked else "(半档试用)" if self._probation else ""}'
                 )
+            elif self._rate_mode == 'limited' and self._probation:
+                if now - self._clean_since >= RATE_LIMIT_CLEAN_WINDOW:
+                    # 半档试用期满无429: 锁定当前半档
+                    self._probation = False
+                    self._locked = True
+                    logger.info(f'试用{RATE_LIMIT_CLEAN_WINDOW:.0f}秒无429, 倍速锁定 {self._multiplier:g}x')
             elif self._rate_mode == 'limited' and not self._locked:
                 if now - self._clean_since >= RATE_LIMIT_CLEAN_WINDOW:
-                    # 阶梯升档: 首档直接2x, 之后每次+2(1x→2x→4x→6x→8x), 撞墙后回退上一档
-                    self._prev_multiplier = self._multiplier
+                    # 阶梯升档: 首档直接2x, 之后每次+2(1x→2x→4x→6x→8x)
                     self._multiplier = 2 if self._multiplier < 2 else self._multiplier + 2
                     self._clock_origin = now
                     self._media_consumed = 0.0
@@ -179,7 +187,7 @@ class Downloader(object):
             if self._rate_mode == 'normal':
                 # 正常源首次撞429: 成为429源, 探测成功后从1x起步
                 self._pending_multiplier = RATE_LIMIT_START_MULTIPLIER
-                self._prev_multiplier = None
+                self._probation = False
                 self._locked = False
                 action = (f'转入单线程探测(每{RATE_LIMIT_PROBE_INTERVAL:.0f}s), '
                           f'探测成功后按 {self._pending_multiplier:g}x 起步')
@@ -188,11 +196,19 @@ class Downloader(object):
                     # 锁定期撞墙: 倍速不再调整, 冷却后维持当前档
                     self._pending_multiplier = self._multiplier
                     action = f'倍速维持 {self._multiplier:g}x(已锁定)'
-                elif self._prev_multiplier is not None:
-                    # 攀升期撞墙: 退回上一档并锁定
-                    self._pending_multiplier = self._prev_multiplier
+                elif self._probation:
+                    # 半档试用仍撞墙: 锁定到再退一档(上一个确认档)
+                    self._probation = False
                     self._locked = True
+                    self._pending_multiplier = max(self._multiplier - 1, RATE_LIMIT_START_MULTIPLIER)
                     action = f'倍速由 {self._multiplier:g}x 退回 {self._pending_multiplier:g}x 并锁定'
+                elif self._multiplier > 1:
+                    # 攀升撞墙: 先退半档试用, 试用期内再撞429则退回上一个确认档锁定
+                    self._pending_multiplier = self._multiplier - 1
+                    self._probation = True
+                    next_fallback = max(self._pending_multiplier - 1, RATE_LIMIT_START_MULTIPLIER)
+                    action = (f'倍速由 {self._multiplier:g}x 退回 {self._pending_multiplier:g}x 试用, '
+                              f'再撞429则锁定 {next_fallback:g}x')
                 else:
                     # 1x起步就撞墙: 维持1x, 不锁定(给偶发429留恢复空间)
                     self._pending_multiplier = self._multiplier
