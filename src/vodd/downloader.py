@@ -35,11 +35,11 @@ logger = logging.getLogger(__name__)
 
 # 429通用处理: 主动节流 + 自适应冷却, 不额外暴露参数
 RATE_LIMIT_INITIAL_INTERVAL = 0.2  # 初始主动节流: 每请求间隔(秒), 即 5 请求/秒
-RATE_LIMIT_MIN_INTERVAL = 0.05  # 节流下限, 最快不超过 20 请求/秒
+RATE_LIMIT_MIN_INTERVAL = 0.1  # 节流下限, 最快不超过 10 请求/秒
 RATE_LIMIT_MAX_INTERVAL = 60.0  # 节流上限, 最慢 1 请求/分钟
 RATE_LIMIT_INCREASE_FACTOR = 1.5  # 触发429时至少把间隔放大1.5倍
 RATE_LIMIT_DECREASE_FACTOR = 0.9  # 连续成功时每次把间隔缩小10%
-RATE_LIMIT_SUCCESS_STREAK = 10  # 连续成功多少个请求才放宽一次节流
+RATE_LIMIT_SUCCESS_STREAK = 5  # 连续成功多少个请求才放宽一次节流
 RATE_LIMIT_MAX_RETRIES = 20  # 单个请求最多经历多少次429
 RATE_LIMIT_MAX_COOLDOWN = 300  # 单次冷却时间上限(秒)
 RATE_LIMIT_MIN_COOLDOWN = 1  # 无Retry-After时的最小退避(秒)
