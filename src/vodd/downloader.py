@@ -159,24 +159,26 @@ class Downloader(object):
         delay = min(delay, RATE_LIMIT_MAX_COOLDOWN)
         with self._rate_lock:
             now = time.monotonic()
-            since = max(self._since_429_requests, 1)
-            elapsed = max(now - self._since_429_start, 0.0)
-            # 服务端允许 since 个请求后要冷却 delay 秒 -> 可持续间隔 = (elapsed+delay)/since
-            estimate = (elapsed + delay) / since
-            self._min_interval = min(
-                max(self._min_interval * RATE_LIMIT_INCREASE_FACTOR, estimate),
-                RATE_LIMIT_MAX_INTERVAL,
-            )
-            self._since_429_requests = 0
-            self._since_429_start = now + delay
-            self._success_streak = 0
             until = now + delay
-            # 已有冷却时, 只在明显延长时才覆盖, 避免并发线程反复堆叠
-            extended = until > self._cooldown_until + 1
-            if extended:
+            # 一轮冷却只统计一个429: 当前不在冷却期才算新一轮, 才会重算节流
+            # 其余并发线程的429只负责延长冷却, 不再用被清零的 since 重算, 避免 estimate 一步放大到上限
+            new_round = self._cooldown_until <= now + 1
+            if new_round:
+                since = max(self._since_429_requests, 1)
+                elapsed = max(now - self._since_429_start, 0.0)
+                # 服务端允许 since 个请求后要冷却 delay 秒 -> 可持续间隔 = (elapsed+delay)/since
+                estimate = (elapsed + delay) / since
+                self._min_interval = min(
+                    max(self._min_interval * RATE_LIMIT_INCREASE_FACTOR, estimate),
+                    RATE_LIMIT_MAX_INTERVAL,
+                )
+                self._since_429_requests = 0
+                self._since_429_start = now + delay
+                self._success_streak = 0
+            if until > self._cooldown_until:
                 self._cooldown_until = until
                 self._cooldown_started = True
-        if extended:
+        if new_round:
             logger.warning(
                 f'触发限流(429), 冷却 {delay:.0f}s, 主动节流调至 {self._min_interval:.2f}s/请求: {url}'
             )
