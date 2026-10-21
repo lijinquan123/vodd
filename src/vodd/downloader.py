@@ -101,6 +101,7 @@ class Downloader(object):
         self._clock_origin = 0.0  # 播放时钟起点(单调钟)
         self._media_consumed = 0.0  # 已放行请求的媒体秒数(播放时钟)
         self._next_request_at = 0.0  # 探测模式: 下一个请求允许发出的时间戳
+        self._probe_leader = 0  # 探测线程id(0=无): 探测模式下唯一发请求的线程
 
     def _acquire_slot(self, cost: float = 0.0):
         """
@@ -136,6 +137,30 @@ class Downloader(object):
                     else:
                         return
             time.sleep(min(max(remain, 0.05), 1.0))
+
+    def _claim_probe_leader(self) -> bool:
+        """探测模式下竞争探测权: 同一时刻只有一个线程真正发探测请求, 其余全部挂起"""
+        with self._rate_lock:
+            if self._rate_mode != 'probe':
+                return True
+            if self._probe_leader == 0:
+                self._probe_leader = threading.get_ident()
+            return self._probe_leader == threading.get_ident()
+
+    def _wait_probe_result(self):
+        """
+        非探测线程挂起等待: 直到探测线程拿到真实内容(退出探测模式)或失败/终止,
+        期间不发起任何请求, 避免轮询多个切片加剧风控
+        """
+        while True:
+            if self.is_stop_all:
+                raise DownloadTaskError('下载已被终止')
+            if (duration := time.time() - self.start_time) > self.overall_timeout:
+                raise ReachMaxDownloadLimitError(f'timeout: {int(duration)}')
+            with self._rate_lock:
+                if self._rate_mode != 'probe' or self._probe_leader == 0:
+                    return
+            time.sleep(0.2)
 
     def _note_success(self, cost: float = 0.0):
         """
@@ -252,6 +277,9 @@ class Downloader(object):
             else:
                 # 探测期仍在429: 只延长冷却
                 action = '继续单线程探测'
+            if self._rate_mode != 'probe':
+                # 新一轮探测: 重置探测权, 由最先回到循环的线程接手
+                self._probe_leader = 0
             self._rate_mode = 'probe'
             self._cooldown_reason = '风控拦截(200假内容)' if junk else '429'
         logger.warning(f'{"内容拦截(200非媒体)" if junk else "触发限流(429)"}, 冷却 {delay:.0f}s, {action}: {url}')
@@ -280,6 +308,10 @@ class Downloader(object):
         attempts = 0
         limited = 0
         while True:
+            # 探测模式下只有一个探测线程真正发请求, 其余线程挂起等待探测结果
+            if self._rate_mode == 'probe' and not self._claim_probe_leader():
+                self._wait_probe_result()
+                continue
             # 探测模式持全局串行门, 保证429源探测期间真正的单线程
             with (self._serial_gate if self._rate_mode == 'probe' else nullcontext()):
                 self._acquire_slot(cost)
