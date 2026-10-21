@@ -602,7 +602,9 @@ class DownloadCore(object):
                         with open(segment.filepath, 'rb') as fr:
                             while chunk := fr.read(self.downloader.chunk_size):
                                 fa.write(chunk)
-                        self.downloader.remove(segment.filepath)
+                        # -k保留模式不删除切片, 供事后检查
+                        if not self.downloader.keep:
+                            self.downloader.remove(segment.filepath)
 
     def merge(self):
         """合并切片"""
