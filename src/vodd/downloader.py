@@ -102,6 +102,7 @@ class Downloader(object):
         self._media_consumed = 0.0  # 已放行请求的媒体秒数(播放时钟)
         self._next_request_at = 0.0  # 探测模式: 下一个请求允许发出的时间戳
         self._probe_leader = 0  # 探测线程id(0=无): 探测模式下唯一发请求的线程
+        self._get_cache = {}  # GET清单(m3u8/mpd)响应缓存: 一次性链接不能重复GET
 
     def _acquire_slot(self, cost: float = 0.0):
         """
@@ -353,6 +354,9 @@ class Downloader(object):
         attempts = 0
         limited = 0
         while True:
+            # GET清单(m3u8/mpd)响应缓存: 一次性链接不能重复GET
+            if method.lower() == 'get' and not media and url in self._get_cache:
+                return self._get_cache[url]
             # 探测模式下只有一个探测线程真正发请求, 其余线程挂起等待探测结果
             if self._rate_mode == 'probe' and not self._claim_probe_leader():
                 self._wait_probe_result()
@@ -375,6 +379,8 @@ class Downloader(object):
                             resp.close()
                             code = 429
                         else:
+                            if method.lower() == 'get' and not media:
+                                self._get_cache[resp.url] = resp
                             self._note_success(cost)
                             return resp
                     else:
