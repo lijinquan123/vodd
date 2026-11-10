@@ -164,7 +164,7 @@ class Downloader(object):
 
     def _note_success(self, cost: float = 0.0):
         """
-        请求成功: 探测模式确认200后开启倍速;
+        请求成功: 探测模式确认200后开启倍速;不存在"静音/静态切片被误杀"的风险
         强行排空期满则复测半档; 半档试用期满60秒无429则锁定; 未锁定且非试用/排空时升档
         """
         with self._rate_lock:
@@ -297,6 +297,51 @@ class Downloader(object):
         else:
             head = resp.content[:1]
         return not head or head in (b'<', b'{')
+
+    def _scan_duplicates(self):
+        """
+        扫描已下载切片(解密后文件)的内容哈希, 返回内容重复的默认切片列表
+        正常切片内容各不相同, 重复出现的内容即默认ts切片(下载过快被换成占位内容)
+        """
+        groups = defaultdict(list)
+        for segment in self.tasks:
+            if segment.filepath.exists():
+                groups[md5(segment.filepath.read_bytes()).hexdigest()].append(segment)
+        return [seg for segs in groups.values() if len(segs) > 1 for seg in segs]
+
+    def _enter_rate_limit(self):
+        """发现默认切片(下载过快)后转入单线程探测降速, 之后按倍速阶梯恢复"""
+        with self._rate_lock:
+            if self._rate_mode == 'normal':
+                self._pending_multiplier = RATE_LIMIT_START_MULTIPLIER
+                self._probation = False
+                self._probation_retest = False
+                self._draining = False
+                self._locked = False
+            self._probe_leader = 0
+            self._rate_mode = 'probe'
+            self._cooldown_reason = '默认切片(内容重复)'
+        logger.warning('检测到默认切片(内容重复), 转入单线程探测降速')
+
+    def _retry_duplicates(self):
+        """下载完成后: 扫描重复切片(默认ts)并降速重试, 直到无重复"""
+        retries = 0
+        while True:
+            if self.is_stop_all:
+                return
+            duplicates = self._scan_duplicates()
+            if not duplicates:
+                return
+            retries += 1
+            if retries > RATE_LIMIT_MAX_RETRIES:
+                raise HTTPStatusCodeError('默认切片重试超限')
+            self._enter_rate_limit()
+            logger.warning(f'第{retries}轮发现{len(duplicates)}个默认切片, 降速重试')
+            for segment in duplicates:
+                if self.is_stop_all:
+                    return
+                segment.confirmed = False
+                self.download(segment)
 
     def requester(self, method: str, url: str, cost: float = 0.0, media: bool = False, **kwargs):
         """
@@ -517,6 +562,7 @@ class Downloader(object):
             threading.Thread(target=self.watchdog).start()
             self.concurrent()
             time.sleep(1)
+            self._retry_duplicates()
             if self.is_all_confirmed:
                 self.core.concat()
                 self.core.merge()
