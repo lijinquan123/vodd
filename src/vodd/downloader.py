@@ -103,6 +103,7 @@ class Downloader(object):
         self._next_request_at = 0.0  # 探测模式: 下一个请求允许发出的时间戳
         self._probe_leader = 0  # 探测线程id(0=无): 探测模式下唯一发请求的线程
         self._get_cache = {}  # GET清单(m3u8/mpd)响应缓存: 一次性链接不能重复GET
+        self._seen = {}  # 切片内容哈希 -> [切片], 重复(默认切片)回溯一起重试
 
     def _acquire_slot(self, cost: float = 0.0):
         """
@@ -299,17 +300,6 @@ class Downloader(object):
             head = resp.content[:1]
         return not head or head in (b'<', b'{')
 
-    def _scan_duplicates(self):
-        """
-        扫描已下载切片(解密后文件)的内容哈希, 返回内容重复的默认切片列表
-        正常切片内容各不相同, 重复出现的内容即默认ts切片(下载过快被换成占位内容)
-        """
-        groups = defaultdict(list)
-        for segment in self.tasks:
-            if segment.filepath.exists():
-                groups[md5(segment.filepath.read_bytes()).hexdigest()].append(segment)
-        return [seg for segs in groups.values() if len(segs) > 1 for seg in segs]
-
     def _enter_rate_limit(self):
         """发现默认切片(下载过快)后转入单线程探测降速, 之后按倍速阶梯恢复"""
         with self._rate_lock:
@@ -323,26 +313,6 @@ class Downloader(object):
             self._rate_mode = 'probe'
             self._cooldown_reason = '默认切片(内容重复)'
         logger.warning('检测到默认切片(内容重复), 转入单线程探测降速')
-
-    def _retry_duplicates(self):
-        """下载完成后: 扫描重复切片(默认ts)并降速重试, 直到无重复"""
-        retries = 0
-        while True:
-            if self.is_stop_all:
-                return
-            duplicates = self._scan_duplicates()
-            if not duplicates:
-                return
-            retries += 1
-            if retries > RATE_LIMIT_MAX_RETRIES:
-                raise HTTPStatusCodeError('默认切片重试超限')
-            self._enter_rate_limit()
-            logger.warning(f'第{retries}轮发现{len(duplicates)}个默认切片, 降速重试')
-            for segment in duplicates:
-                if self.is_stop_all:
-                    return
-                segment.confirmed = False
-                self.download(segment)
 
     def requester(self, method: str, url: str, cost: float = 0.0, media: bool = False, **kwargs):
         """
@@ -459,6 +429,7 @@ class Downloader(object):
             )
             task.confirmed = True
             self.plugin.decrypt(task).rename(task.filepath)
+            self._check_duplicate(task)
         except DownloadException as e:
             self.is_stop_all = True
             if not self.error:
@@ -466,6 +437,34 @@ class Downloader(object):
         except Exception as e:
             self.is_stop_all = True
             logger.error(f'下载任务异常: {e}')
+
+    def _check_duplicate(self, task: Segment):
+        """下载完成后检测默认切片(内容重复), 命中则触发限流并回溯重试同内容切片"""
+        digest = md5(task.filepath.read_bytes()).hexdigest()
+        group = self._seen.setdefault(digest, [])
+        group.append(task)
+        if len(group) <= 1:
+            return
+        self._enter_rate_limit()
+        for seg in list(group):
+            if not seg.confirmed:
+                continue  # 正在下载/重试中, 跳过
+            self._redownload(seg)
+            new_digest = md5(seg.filepath.read_bytes()).hexdigest()
+            if new_digest != digest:
+                # 重试成功(内容变了), 从旧组移出并按新哈希归类
+                group.remove(seg)
+                self._seen.setdefault(new_digest, []).append(seg)
+
+    def _redownload(self, seg: Segment):
+        """回溯重试切片: 重新下载, 不再递归检测"""
+        seg.confirmed = False
+        self.smart_save(
+            seg.url, seg.headers, seg.filepath,
+            cost=seg.duration or NOMINAL_SEGMENT_DURATION,
+        )
+        self.plugin.decrypt(seg).rename(seg.filepath)
+        seg.confirmed = True
 
     def smart_save(self, url: str, headers: dict, path: Path, cost: float = 0.0):
         rk = {}
@@ -568,7 +567,6 @@ class Downloader(object):
             threading.Thread(target=self.watchdog).start()
             self.concurrent()
             time.sleep(1)
-            self._retry_duplicates()
             if self.is_all_confirmed:
                 self.core.concat()
                 self.core.merge()
