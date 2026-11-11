@@ -106,6 +106,7 @@ class Downloader(object):
         self._probe_leader = 0  # 探测线程id(0=无): 探测模式下唯一发请求的线程
         self._get_cache = {}  # GET清单(m3u8/mpd)响应缓存: 一次性链接不能重复GET
         self._seen = {}  # 切片内容哈希 -> [切片], 重复(默认切片)回溯一起重试
+        self._limited = 0  # 全局退避计数(429/内容拦截次数), 冷却时间随之单调递增
 
         # 固定倍速(可选): 指定后全程按该倍速下载, 撞限流也不升降
         if (fixed := kwargs.get('multiplier') or 0.0) > 0:
@@ -340,7 +341,7 @@ class Downloader(object):
         """
         code = None
         attempts = 0
-        limited = 0
+        limited = 0  # 单请求退避计数: 超限则放弃该请求
         while True:
             # GET清单(m3u8/mpd)响应缓存: 一次性链接不能重复GET
             if method.lower() == 'get' and not media and url in self._get_cache:
@@ -383,10 +384,11 @@ class Downloader(object):
                     time.sleep(0.1)
             if code == 429:
                 # 429与内容拦截不计入普通重试次数, 冷却后继续请求同一个链接
-                limited += 1
+                self._limited += 1  # 全局退避计数: 冷却时间单调递增
+                limited += 1        # 单请求退避计数: 超限则放弃该请求
                 if limited > RATE_LIMIT_MAX_RETRIES:
                     raise HTTPStatusCodeError('200junk' if junk else f'{code}')
-                self._cool_down(resp, limited, url, junk=junk)
+                self._cool_down(resp, self._limited, url, junk=junk)
                 continue
             attempts += 1
             if attempts >= self.max_download_times:
