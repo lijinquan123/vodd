@@ -26,11 +26,15 @@ def build_parser():
     parser = argparse.ArgumentParser(usage='VOD Downloader', description='--help')
     parser.add_argument('-c', type=str, dest='config', help='从配置文件中读取所有参数,配置参数会覆盖命令参数')
     parser.add_argument('-o', type=str, dest='save_path', default='', help='需要保存的路径')
-    parser.add_argument('-r', type=float, default=5, dest='rate', help='下载速度,实际上会略小于当前值')
+    parser.add_argument('-r', type=float, default=0, dest='rate', help='并发下载线程数')
+    parser.add_argument('-x', '--multiplier', type=float, default=0, dest='multiplier',
+                        help='固定下载倍速(x倍实时速率), 0=不限速(默认)')
+    parser.add_argument('-p', type=str, dest='plugin', default='', help='插件名字')
+    parser.add_argument('-k', action='store_true', dest='keep',
+                        help='保留所有ts切片与合并后的视频文件, 下载结束后不删除缓存目录')
     parser.add_argument("--duration-only", action=argparse.BooleanOptionalAction, default=False, help='只获取时长')
 
     downloader = parser.add_argument_group('downloader')
-    downloader.add_argument('-p', type=str, dest='plugin', default='', help='插件名字')
     downloader.add_argument('--url', type=str, dest='url', help='播放链接')
     downloader.add_argument('--headers', dest='headers', type=jsonloads, help='播放使用的请求头')
     downloader.add_argument('--drm-request', dest='drm_request', type=jsonloads, help='请求DRM许可使用的请求数据')
@@ -48,8 +52,6 @@ def build_parser():
                             help='分块文件大小')
     downloader.add_argument('--segment-size', type=int, default=0, dest='segment_size',
                             help='下载切片的数量，默认全部下载')
-    downloader.add_argument('-k', action='store_true', dest='keep',
-                            help='保留所有ts切片与合并后的视频文件, 下载结束后不删除缓存目录')
 
     selector = parser.add_argument_group('selector')
     selector.add_argument('--height', type=commalist, dest='height', default='1080,480,1080',

@@ -53,6 +53,8 @@ class Downloader(object):
             raise FFmpegNotFoundError('找不到FFmpeg程序,当前程序即刻停止')
         # 必须参数
         self.save_path = Path(save_path)
+        if rate <= 0:
+            rate = 5
         self.threads_num = math.ceil(rate)
         self.kwargs = kwargs
         self.duration_only = kwargs['duration_only']
@@ -104,6 +106,14 @@ class Downloader(object):
         self._probe_leader = 0  # 探测线程id(0=无): 探测模式下唯一发请求的线程
         self._get_cache = {}  # GET清单(m3u8/mpd)响应缓存: 一次性链接不能重复GET
         self._seen = {}  # 切片内容哈希 -> [切片], 重复(默认切片)回溯一起重试
+
+        # 固定倍速(可选): 指定后全程按该倍速下载, 撞限流也不升降
+        if (fixed := kwargs.get('multiplier') or 0.0) > 0:
+            self._rate_mode = 'limited'
+            self._multiplier = fixed
+            self._pending_multiplier = fixed
+            self._locked = True
+            self._clock_origin = time.monotonic()
 
     def _acquire_slot(self, cost: float = 0.0):
         """
