@@ -76,6 +76,10 @@ class Downloader(object):
         self.start_time = time.time()
         self.session = requests.Session()
         self.request_kwargs = get_request_kwargs(**kwargs)
+        # 心跳保活(可选): heartbeat-request 有 url 时开启守护线程定时发请求
+        self.heartbeat_interval = kwargs.get('heartbeat_interval', 5)
+        if (heartbeat_request := kwargs.get('heartbeat_request') or {}).get('url'):
+            threading.Thread(target=self._heartbeat_loop, args=(heartbeat_request,), daemon=True).start()
         self.core = DownloadCore(self)
         self.tasks = []
         self.segments = defaultdict(lambda: defaultdict(list))
@@ -115,6 +119,16 @@ class Downloader(object):
             self._pending_multiplier = fixed
             self._locked = True
             self._clock_origin = time.monotonic()
+
+    def _heartbeat_loop(self, req: dict):
+        """心跳保活守护线程: 原封不动按 heartbeat-request 发请求, daemon线程随主进程结束"""
+        while True:
+            time.sleep(self.heartbeat_interval)
+            try:
+                req.setdefault('method', 'GET')
+                self.session.request(**req)
+            except Exception as e:
+                logger.warning(f'心跳请求异常: {e}')
 
     def _acquire_slot(self, cost: float = 0.0):
         """

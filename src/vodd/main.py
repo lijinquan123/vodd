@@ -37,6 +37,10 @@ def build_parser():
     downloader = parser.add_argument_group('downloader')
     downloader.add_argument('--url', type=str, dest='url', help='播放链接')
     downloader.add_argument('--headers', dest='headers', type=jsonloads, help='播放使用的请求头')
+    downloader.add_argument('--heartbeat-request', dest='heartbeat_request', type=jsonloads,
+                            help='心跳保活请求, 例: {"method":"POST","url":"https://...","json":{...}}')
+    downloader.add_argument('--heartbeat-interval', dest='heartbeat_interval', type=float, default=60,
+                            help='心跳间隔(秒), 默认60')
     downloader.add_argument('--drm-request', dest='drm_request', type=jsonloads, help='请求DRM许可使用的请求数据')
     downloader.add_argument('--drm-private-key-path', type=str, dest='private_key_path', help='DRM私钥文件路径')
     downloader.add_argument('--drm-client-id-path', type=str, dest='client_id_path', help='DRM客户端ID路径')
