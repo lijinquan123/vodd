@@ -179,7 +179,7 @@ class Downloader(object):
                 self._media_consumed = cost  # 本次探测成功的请求计入播放时钟
                 self._clean_since = now
                 tag = ('(已锁定)' if self._locked else '(强行排空)' if self._draining
-                       else '(半档试用)' if self._probation else '')
+                else '(半档试用)' if self._probation else '')
                 logger.info(f'探测成功(真实内容), 开启倍速模式: {self._multiplier:g}x{tag}')
             if self._rate_mode == 'limited':
                 if self._draining:
@@ -288,17 +288,25 @@ class Downloader(object):
 
     def _junk_content(self, resp, stream: bool) -> bool:
         """
-        媒体内容校验: 拦截"200但内容非媒体"的响应(反爬挑战页/错误页等)
-        此类内容为文本且以<或{开头, 真实媒体流不会; 空响应同样视为异常
+        媒体内容校验: 拦截"200但内容异常"的响应
+        - 首字节<或{或空: 文本假内容(反爬页/错误页), 判异常重试
+        - 内容与已下载切片重复: 默认ts切片(下载过快被换占位), 实时触发限流降速
         流式响应只预读首个分块并暂存到resp上, 剩余由调用方继续消费
         """
         if stream:
             peek = next(resp.iter_content(self.chunk_size), b'')
             resp._vodd_first_chunk = peek
-            head = peek[:1]
+            content = peek
         else:
-            head = resp.content[:1]
-        return not head or head in (b'<', b'{')
+            content = resp.content
+        head = content[:1]
+        if not head or head in (b'<', b'{'):
+            return True
+        if md5(content).hexdigest() in self._seen:
+            # 默认切片(内容重复): 实时触发限流降速
+            self._enter_rate_limit()
+            return True
+        return False
 
     def _enter_rate_limit(self):
         """发现默认切片(下载过快)后转入单线程探测降速, 之后按倍速阶梯恢复"""
@@ -474,7 +482,8 @@ class Downloader(object):
         try:
             if self.chunked_mode:
                 st_time = time.time()
-                with self.requester('get', url, cost=cost, media=True, stream=True, **rk) as resp, open(path, 'wb') as f:
+                with self.requester('get', url, cost=cost, media=True, stream=True, **rk) as resp, open(path,
+                                                                                                        'wb') as f:
                     self.downloaded_size[path.name][1] = int(resp.headers.get('Content-Length', 0))
                     if (first := getattr(resp, '_vodd_first_chunk', b'')):
                         # 内容校验时预读的首块, 先落盘再继续流式读取
